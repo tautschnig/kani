@@ -17,8 +17,8 @@ jobs:
       - name: Checkout Kani
         uses: actions/checkout@v3
 
-			- name: Update toolchain config
-				run: |
+      - name: Update toolchain config
+        run: |
           current_toolchain_date=$(grep ^channel rust-toolchain.toml | sed 's/.*nightly-\(.*\)"/\1/')
           current_toolchain_epoch=$(date --date $current_toolchain_date +%s)
           next_toolchain_date=$(date --date "@$(($current_toolchain_epoch + 86400))" +%Y-%m-%d)
