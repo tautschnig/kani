@@ -1,9 +1,7 @@
 # Copyright Kani Contributors
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 
-# We use block scalar notation to allow us to add ":" to the workflow name.
-name: >-
-  Every 4 hours: Attempt toolchain update
+name: Attempt toolchain update
 
 on:
   schedule:
