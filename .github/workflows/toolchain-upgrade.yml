@@ -35,6 +35,8 @@ jobs:
           git log --oneline $current_toolchain_hash..$next_toolchain_hash | \
             sed 's#^#https://github.com/rust-lang/rust/commit/#' >> $GITHUB_ENV
           echo "$EOF" >> $GITHUB_ENV
+          cd ..
+          rm -rf rust.git
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v4
         with:
@@ -52,4 +54,5 @@ jobs:
             https://github.com/rust-lang/rust/commit/${{ env.current_toolchain_hash }} up to
             https://github.com/rust-lang/rust/commit/${{ env.next_toolchain_hash }}. The log
             for this commit range is:
+            
             ${{ env.git_log }}
