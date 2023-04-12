@@ -231,6 +231,17 @@ impl<'tcx> TypeOrVariant<'tcx> {
             }
         }
     }
+
+    #[allow(dead_code)]
+    pub fn expect_gen_variant(&self) -> VariantIdx {
+        match self {
+            TypeOrVariant::Type(t) => panic!("expect a generator but found type: {t:?}"),
+            TypeOrVariant::Variant(v) => {
+                panic!("expect a generator but found variant: {v:?}")
+            }
+            TypeOrVariant::GeneratorVariant(v) => *v,
+        }
+    }
 }
 
 impl<'tcx> GotocCtx<'tcx> {
@@ -622,6 +633,17 @@ impl<'tcx> GotocCtx<'tcx> {
             )),
             _ => result,
         }
+    }
+
+    /// Given a projection, generate an lvalue that represents the given variant index.
+    pub fn codegen_variant_lvalue(
+        &mut self,
+        initial_projection: ProjectedPlace<'tcx>,
+        variant_idx: VariantIdx,
+    ) -> ProjectedPlace<'tcx> {
+        debug!(?initial_projection, ?variant_idx, "codegen_variant_lvalue");
+        let downcast = ProjectionElem::Downcast(None, variant_idx);
+        self.codegen_projection(Ok(initial_projection), downcast).unwrap()
     }
 
     // https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/mir/enum.ProjectionElem.html

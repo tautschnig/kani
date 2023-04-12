@@ -131,7 +131,7 @@ pub enum ExprValue {
     StringConstant {
         s: InternedString,
     },
-    /// Struct initializer  
+    /// Struct initializer
     /// `struct foo the_foo = >>> {field1, field2, ... } <<<`
     Struct {
         values: Vec<Expr>,
@@ -142,7 +142,7 @@ pub enum ExprValue {
     },
     /// `(typ) self`. Target type is in the outer `Expr` struct.
     Typecast(Expr),
-    /// Union initializer  
+    /// Union initializer
     /// `union foo the_foo = >>> {.field = value } <<<`
     Union {
         value: Expr,
@@ -681,7 +681,7 @@ impl Expr {
         expr!(StatementExpression { statements: ops }, typ)
     }
 
-    /// Internal helper function for Struct initalizer  
+    /// Internal helper function for Struct initalizer
     /// `struct foo the_foo = >>> {.field1 = val1, .field2 = val2, ... } <<<`
     /// ALL fields must be given, including padding
     fn struct_expr_with_explicit_padding(
@@ -698,7 +698,7 @@ impl Expr {
         expr!(Struct { values }, typ)
     }
 
-    /// Struct initializer  
+    /// Struct initializer
     /// `struct foo the_foo = >>> {.field1 = val1, .field2 = val2, ... } <<<`
     /// Note that only the NON padding fields should be explicitly given.
     /// Padding fields are automatically inserted using the type from the `SymbolTable`
@@ -719,7 +719,7 @@ impl Expr {
             "Error in struct_expr; mismatch in number of fields and components.\n\t{typ:?}\n\t{components:?}"
         );
 
-        // Check that each formal field has an value
+        // Check that each formal field has a value
         for field in non_padding_fields {
             let field_typ = field.field_typ().unwrap();
             let value = components.get(&field.name()).unwrap();
@@ -764,7 +764,7 @@ impl Expr {
         Expr::struct_expr_from_values(typ, values, symbol_table)
     }
 
-    /// Struct initializer  
+    /// Struct initializer
     /// `struct foo the_foo = >>> {field1, field2, ... } <<<`
     /// Note that only the NON padding fields should be explicitly given.
     /// Padding fields are automatically inserted using the type from the `SymbolTable`
@@ -800,7 +800,7 @@ impl Expr {
         Expr::struct_expr_with_explicit_padding(typ, fields, values)
     }
 
-    /// Struct initializer  
+    /// Struct initializer
     /// `struct foo the_foo = >>> {field1, padding2, field3, ... } <<<`
     /// Note that padding fields should be explicitly given.
     /// This would be used when the values and padding have already been combined,
@@ -859,7 +859,7 @@ impl Expr {
         self.transmute_to(t, st)
     }
 
-    /// Union initializer  
+    /// Union initializer
     /// `union foo the_foo = >>> {.field = value } <<<`
     pub fn union_expr<T: Into<InternedString>>(
         typ: Type,
