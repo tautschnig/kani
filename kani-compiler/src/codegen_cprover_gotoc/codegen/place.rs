@@ -231,17 +231,6 @@ impl<'tcx> TypeOrVariant<'tcx> {
             }
         }
     }
-
-    #[allow(dead_code)]
-    pub fn expect_gen_variant(&self) -> VariantIdx {
-        match self {
-            TypeOrVariant::Type(t) => panic!("expect a generator but found type: {t:?}"),
-            TypeOrVariant::Variant(v) => {
-                panic!("expect a generator but found variant: {v:?}")
-            }
-            TypeOrVariant::GeneratorVariant(v) => *v,
-        }
-    }
 }
 
 impl<'tcx> GotocCtx<'tcx> {

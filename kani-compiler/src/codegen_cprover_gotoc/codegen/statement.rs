@@ -31,30 +31,27 @@ impl<'tcx> GotocCtx<'tcx> {
         debug!(?stmt, kind=?stmt.kind, "handling_statement");
         let location = self.codegen_span(&stmt.source_info.span);
         match &stmt.kind {
-            StatementKind::Assign(box (lhs, rhs)) => {
-                let lty = self.place_ty(lhs);
-                let rty = self.rvalue_ty(rhs);
+            StatementKind::Assign(box (l, r)) => {
+                let lty = self.place_ty(l);
+                let rty = self.rvalue_ty(r);
                 // we ignore assignment for all zero size types
                 if self.is_zst(lty) {
                     Stmt::skip(location)
+                } else if lty.is_fn_ptr() && rty.is_fn() && !rty.is_fn_ptr() {
+                    // implicit address of a function pointer, e.g.
+                    // let fp: fn() -> i32 = foo;
+                    // where the reference is implicit.
+                    unwrap_or_return_codegen_unimplemented_stmt!(self, self.codegen_place(l))
+                        .goto_expr
+                        .assign(self.codegen_rvalue(r, location).address_of(), location)
+                } else if rty.is_bool() {
+                    unwrap_or_return_codegen_unimplemented_stmt!(self, self.codegen_place(l))
+                        .goto_expr
+                        .assign(self.codegen_rvalue(r, location).cast_to(Type::c_bool()), location)
                 } else {
-                    let rvalue = self.codegen_rvalue(rhs, location);
-                    if lty.is_fn_ptr() && rty.is_fn() && !rty.is_fn_ptr() {
-                        // implicit address of a function pointer, e.g.
-                        // let fp: fn() -> i32 = foo;
-                        // where the reference is implicit.
-                        unwrap_or_return_codegen_unimplemented_stmt!(self, self.codegen_place(lhs))
-                            .goto_expr
-                            .assign(rvalue.address_of(), location)
-                    } else if rty.is_bool() {
-                        unwrap_or_return_codegen_unimplemented_stmt!(self, self.codegen_place(lhs))
-                            .goto_expr
-                            .assign(rvalue.cast_to(Type::c_bool()), location)
-                    } else {
-                        unwrap_or_return_codegen_unimplemented_stmt!(self, self.codegen_place(lhs))
-                            .goto_expr
-                            .assign(rvalue, location)
-                    }
+                    unwrap_or_return_codegen_unimplemented_stmt!(self, self.codegen_place(l))
+                        .goto_expr
+                        .assign(self.codegen_rvalue(r, location), location)
                 }
             }
             StatementKind::Deinit(place) => self.codegen_deinit(place, location),
@@ -206,6 +203,8 @@ impl<'tcx> GotocCtx<'tcx> {
         }
     }
 
+    /// Create a statement that sets the variable discriminant to the value that corresponds to the
+    /// variant index.
     pub fn codegen_set_discriminant(
         &mut self,
         dest_ty: Ty<'tcx>,

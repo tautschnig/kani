@@ -1102,12 +1102,7 @@ impl<'tcx> GotocCtx<'tcx> {
                     variants,
                     ..
                 } => (tag_field, variants),
-                Variants::Multiple { .. } => unreachable!(
-                    "Expected generator with direct encoding, got: {type_and_layout:?}"
-                ),
-                Variants::Single { .. } => unreachable!(
-                    "Expected generator with multiple variants, got: {type_and_layout:?}"
-                ),
+                _ => unreachable!("Generators have more than one variant and use direct encoding"),
             };
             // generate a struct for the direct fields of the layout (fields that don't occur in the variants)
             let direct_fields = DatatypeComponent::Field {
