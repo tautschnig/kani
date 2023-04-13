@@ -394,15 +394,14 @@ impl<'tcx> GotocCtx<'tcx> {
                     }
                 }
             }
-            (s, ty::Tuple(substs)) => {
-                // here we have tuples of at most one length
-                if substs.len() == 1 {
-                    let overall_t = self.codegen_ty(ty);
-                    let t = substs[0];
-                    self.codegen_single_variant_single_field(s, span, overall_t, t)
-                } else {
-                    unreachable!()
-                }
+            (Scalar::Int(int), ty::Tuple(_)) => {
+                let int_u128 = int.try_to_uint(int.size()).ok().unwrap();
+                let overall_t = self.codegen_ty(ty);
+                let expr_int = Expr::int_constant(
+                    int_u128,
+                    Type::unsigned_int(overall_t.sizeof_in_bits(&self.symbol_table)),
+                );
+                expr_int.transmute_to(overall_t, &self.symbol_table)
             }
             (_, ty::Array(_, _)) => {
                 // we must have zero size array here
