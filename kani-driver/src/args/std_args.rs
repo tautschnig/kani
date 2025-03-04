@@ -4,6 +4,7 @@
 //! Implements the `verify-std` subcommand handling.
 
 use crate::args::{ValidateArgs, VerificationArgs};
+use crate::args::autoharness_args::CommonAutoharnessArgs;
 use clap::error::ErrorKind;
 use clap::{Error, Parser};
 use kani_metadata::UnstableFeature;
@@ -22,6 +23,9 @@ pub struct VerifyStdArgs {
 
     #[command(flatten)]
     pub verify_opts: VerificationArgs,
+
+    #[command(flatten)]
+    pub common_autoharness_args: CommonAutoharnessArgs,
 }
 
 impl ValidateArgs for VerifyStdArgs {

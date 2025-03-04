@@ -118,7 +118,14 @@ fn standalone_main() -> Result<()> {
             return list_standalone(*list_args, args.verify_opts);
         }
         Some(StandaloneSubcommand::VerifyStd(args)) => {
-            let session = KaniSession::new(args.verify_opts)?;
+            let mut session = KaniSession::new(args.verify_opts)?;
+            if session.args.harnesses.is_empty() {
+                session.enable_autoharness();
+                session.add_auto_harness_args(
+                    args.common_autoharness_args.include_function,
+                    args.common_autoharness_args.exclude_function,
+                );
+            }
             if !session.args.common_args.quiet {
                 print_kani_version(InvocationType::Standalone);
             }
