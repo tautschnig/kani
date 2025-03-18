@@ -53,7 +53,7 @@ pub fn autoharness_standalone(args: StandaloneAutoharnessArgs) -> Result<()> {
 }
 
 /// Print a table of the functions that we skipped and why.
-fn print_skipped_fns(metadata: Vec<KaniMetadata>) {
+pub fn print_skipped_fns(metadata: Vec<KaniMetadata>) {
     let mut skipped_fns = PrettyTable::new();
     skipped_fns.set_header(vec!["Skipped Function", "Reason for Skipping"]);
 

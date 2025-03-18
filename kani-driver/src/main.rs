@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::process::ExitCode;
 
 use anyhow::Result;
-use autoharness::{autoharness_cargo, autoharness_standalone};
+use autoharness::{autoharness_cargo, autoharness_standalone, print_skipped_fns};
 use time::{OffsetDateTime, format_description};
 
 use args::{CargoKaniSubcommand, check_is_valid};
@@ -132,6 +132,10 @@ fn standalone_main() -> Result<()> {
             }
 
             let project = project::std_project(&args.std_path, &session)?;
+            let metadata = project.metadata.clone();
+            if session.args.harnesses.is_empty() {
+                print_skipped_fns(metadata);
+            }
             (session, project)
         }
         None => {
