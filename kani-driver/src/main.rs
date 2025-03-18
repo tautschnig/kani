@@ -121,6 +121,7 @@ fn standalone_main() -> Result<()> {
             let mut session = KaniSession::new(args.verify_opts)?;
             if session.args.harnesses.is_empty() {
                 session.enable_autoharness();
+                session.add_default_bounds();
                 session.add_auto_harness_args(
                     args.common_autoharness_args.include_function,
                     args.common_autoharness_args.exclude_function,
