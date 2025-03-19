@@ -12,8 +12,10 @@ use args::{CargoKaniSubcommand, check_is_valid};
 use args_toml::join_args;
 
 use crate::args::StandaloneSubcommand;
+use crate::args::list_args::Format;
 use crate::concrete_playback::playback::{playback_cargo, playback_standalone};
-use crate::list::collect_metadata::{list_cargo, list_standalone};
+use crate::list::collect_metadata::{list_cargo, list_standalone, process_metadata};
+use crate::list::output::output_list_results;
 use crate::project::Project;
 use crate::session::KaniSession;
 use crate::version::print_kani_version;
@@ -136,6 +138,8 @@ fn standalone_main() -> Result<()> {
             if session.args.harnesses.is_empty() {
                 print_skipped_fns(metadata);
             }
+            let list_metadata = process_metadata(project.metadata.clone());
+            let _ = output_list_results(list_metadata, Format::Json, session.args.common_args.quiet);
             (session, project)
         }
         None => {
