@@ -16,10 +16,20 @@ permissions:
 
 jobs:
   create-cargo-update-pr:
+    # Only run this workflow on the main repository, not on forks
+    if: github.repository == 'model-checking/kani'
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout Kani
         uses: actions/checkout@v5
+
+      - name: Verify repository
+        run: |
+          # Double-check that we're running on the main repository, not a fork
+          if [[ "${{ github.repository }}" != "model-checking/kani" ]]; then
+            echo "This workflow should only run on the model-checking/kani repository"
+            exit 1
+          fi
 
       - name: Setup Kani Dependencies
         uses: ./.github/actions/setup
@@ -64,7 +74,8 @@ jobs:
           fi
 
       - name: Create Pull Request
-        if: ${{ env.next_step == 'create_pr' }}
+        # Only create PR if we're on the main repository and the next step is to create a PR
+        if: ${{ env.next_step == 'create_pr' && github.repository == 'model-checking/kani' }}
         uses: peter-evans/create-pull-request@v7
         with:
           commit-message: Upgrade CBMC from ${{ env.CBMC_VERSION }} to ${{ env.CBMC_LATEST }}
@@ -75,7 +86,8 @@ jobs:
             Upgrade CBMC to its latest release.
 
       - name: Create Issue
-        if: ${{ env.next_step == 'create_issue' && github.repository_owner == 'model-checking' }}
+        # This already has a check for the model-checking repository, but let's make it more explicit
+        if: ${{ env.next_step == 'create_issue' && github.repository == 'model-checking/kani' }}
         uses: dacbd/create-issue-action@main
         with:
           token: ${{ github.token }}

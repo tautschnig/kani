@@ -15,10 +15,20 @@ permissions:
 
 jobs:
   create-cargo-update-pr:
+    # Only run this workflow on the main repository, not on forks
+    if: github.repository == 'model-checking/kani'
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout Kani
         uses: actions/checkout@v5
+
+      - name: Verify repository
+        run: |
+          # Double-check that we're running on the main repository, not a fork
+          if [[ "${{ github.repository }}" != "model-checking/kani" ]]; then
+            echo "This workflow should only run on the model-checking/kani repository"
+            exit 1
+          fi
 
       - name: Setup Kani Dependencies
         uses: ./.github/actions/setup
@@ -36,7 +46,10 @@ jobs:
             cargo build-dev
             git diff
           fi
+          
       - name: Create Pull Request
+        # Additional check to ensure we're on the main repository before creating a PR
+        if: github.repository == 'model-checking/kani'
         uses: peter-evans/create-pull-request@v7
         with:
           commit-message: Upgrade cargo dependencies to ${{ env.today }}
