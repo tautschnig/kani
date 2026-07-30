@@ -193,25 +193,23 @@ mod yes_harness {
         x
     }
 
-    fn f_const_pointer(x: u32, _y: *const i32) -> u32 {
-        x
-    }
-
-    fn f_mut_pointer(x: u32, _y: *mut i32) -> u32 {
-        x
-    }
-
-    fn f_generic<T>(x: u32, _y: T) -> u32 {
+    fn f_slice(x: u32, _y: &[u8]) -> u32 {
         x
     }
 }
 
 mod no_harness {
     use crate::{DerivesArbitrary, DoesntImplementArbitrary};
-    fn unsupported_vec(x: u32, _y: Vec<u8>) -> u32 {
+    fn unsupported_generic<T>(x: u32, _y: T) -> u32 {
         x
     }
-    fn unsupported_slice(x: u32, _y: &[u8]) -> u32 {
+    fn unsupported_const_pointer(x: u32, _y: *const i32) -> u32 {
+        x
+    }
+    fn unsupported_mut_pointer(x: u32, _y: *mut i32) -> u32 {
+        x
+    }
+    fn unsupported_vec(x: u32, _y: Vec<u8>) -> u32 {
         x
     }
     fn doesnt_implement_arbitrary(
@@ -222,5 +220,5 @@ mod no_harness {
     }
     // Test that we correctly render the name of the argument "_" in the table of skipped functions
     // (this argument will have no var_debug_info from rustc_public, unlike arguments with names)
-    fn unsupported_no_arg_name(_: Vec<u8>) {}
+    fn unsupported_no_arg_name(_: *const i32) {}
 }

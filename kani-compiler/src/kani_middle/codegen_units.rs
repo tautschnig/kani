@@ -9,13 +9,15 @@
 
 use crate::args::{Arguments, ReachabilityType};
 use crate::kani_middle::attributes::{KaniAttributes, is_proof_harness};
-use crate::kani_middle::autoharness_supported_arg_ty;
 use crate::kani_middle::kani_functions::{KaniIntrinsic, KaniModel};
 use crate::kani_middle::metadata::{
     gen_automatic_proof_metadata, gen_contracts_metadata, gen_proof_metadata,
 };
 use crate::kani_middle::reachability::filter_crate_items;
 use crate::kani_middle::stubbing::{check_compatibility, harness_stub_map};
+use crate::kani_middle::{ArgSupport, autoharness_supported_arg_ty};
+use rustc_infer::infer::TyCtxtInferExt;
+use rustc_trait_selection::traits::{Obligation, ObligationCause, ObligationCtxt};
 use crate::kani_queries::QueryDb;
 use kani_metadata::{
     ArtifactType, AssignsContract, AutoHarnessMetadata, AutoHarnessSkipReason, HarnessMetadata,
@@ -24,7 +26,6 @@ use kani_metadata::{
 use regex::RegexSet;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
-use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::ty::{self, TyCtxt, TypingMode};
 use rustc_public::mir::mono::Instance;
 use rustc_public::rustc_internal;
@@ -35,7 +36,6 @@ use rustc_public::ty::{
 use rustc_public::{CrateDef, CrateItem};
 use rustc_public_bridge::IndexedVal;
 use rustc_session::config::OutputType;
-use rustc_trait_selection::traits::{Obligation, ObligationCause, ObligationCtxt};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::BufWriter;
@@ -108,12 +108,15 @@ impl CodegenUnits {
                     args,
                     &crate_info.name,
                     *kani_fns.get(&KaniModel::Any.into()).unwrap(),
+                    *kani_fns.get(&KaniModel::BoundedAny.into()).unwrap(),
                 );
                 AUTOHARNESS_MD
                     .set(AutoHarnessMetadata {
                         chosen: chosen
                             .iter()
-                            .map(|func| crate::kani_middle::strip_local_crate_prefix(func.name()))
+                            .map(|(func, _)| {
+                                crate::kani_middle::strip_local_crate_prefix(func.name())
+                            })
                             .collect::<BTreeSet<_>>(),
                         skipped,
                     })
@@ -366,13 +369,13 @@ fn determine_targets(
 /// the AutomaticHarnessPass will later transform the bodies of these instances to actually verify the function.
 fn get_all_automatic_harnesses(
     tcx: TyCtxt,
-    verifiable_fns: Vec<Instance>,
+    verifiable_fns: Vec<(Instance, bool)>,
     kani_harness_intrinsic: FnDef,
     base_filename: &Path,
 ) -> HashMap<Harness, HarnessMetadata> {
     verifiable_fns
         .into_iter()
-        .map(|fn_to_verify| {
+        .map(|(fn_to_verify, is_bounded)| {
             // Set the generic arguments of the harness to be the function it is verifying
             // so that later, in AutomaticHarnessPass, we can retrieve the function to verify
             // and generate the harness body accordingly.
@@ -386,6 +389,7 @@ fn get_all_automatic_harnesses(
                 base_filename,
                 &fn_to_verify,
                 harness.mangled_name(),
+                is_bounded,
             );
             (harness, metadata)
         })
@@ -519,7 +523,8 @@ fn automatic_harness_partition(
     args: &Arguments,
     crate_name: &str,
     kani_any_def: FnDef,
-) -> (Vec<Instance>, BTreeMap<String, AutoHarnessSkipReason>) {
+    kani_bounded_any_def: FnDef,
+) -> (Vec<(Instance, bool)>, BTreeMap<String, AutoHarnessSkipReason>) {
     let crate_fn_defs = rustc_public::local_crate().fn_defs().into_iter().collect::<FxHashSet<_>>();
     // Filter out CrateItems that are functions, but not functions defined in the crate itself, i.e., rustc-inserted functions
     // (c.f. https://github.com/model-checking/kani/issues/4189)
@@ -537,12 +542,14 @@ fn automatic_harness_partition(
     // Cache whether a type implements or can derive Arbitrary
     let mut ty_arbitrary_cache: FxHashMap<Ty, bool> = FxHashMap::default();
 
-    // If `instance` is not eligible for an automatic harness, return the reason why; if it is eligible, return None.
+    // If `func` is not eligible for an automatic harness, return the reason why (`Err`); if it
+    // is eligible, return whether its harness requires *bounded* nondeterministic arguments
+    // (`Ok(true)` iff so).
     // Note that we only return one reason for ineligiblity, when there could be multiple;
     // we can revisit this implementation choice in the future if users request more verbose output.
-    let mut skip_reason = |instance: Instance| -> Option<AutoHarnessSkipReason> {
+    let mut skip_reason = |instance: Instance| -> Result<bool, AutoHarnessSkipReason> {
         if !instance.has_body() {
-            return Some(AutoHarnessSkipReason::NoBody);
+            return Err(AutoHarnessSkipReason::NoBody);
         }
 
         // Preprend the crate name so that users can filter out entire crates using the existing function filter flags.
@@ -558,55 +565,61 @@ fn automatic_harness_partition(
             || name.contains("kani::Arbitrary")
             || name.contains("kani::Invariant")
         {
-            return Some(AutoHarnessSkipReason::KaniImpl);
+            return Err(AutoHarnessSkipReason::KaniImpl);
         }
 
         if autoharness_filtered_out(&name, &included_set, &excluded_set) {
-            return Some(AutoHarnessSkipReason::UserFilter);
+            return Err(AutoHarnessSkipReason::UserFilter);
         }
 
         // Each argument of `instance` must be supported by automatic harness generation, i.e.,
-        // implement Arbitrary (or be capable of deriving it), or be a raw pointer,
+        // implement Arbitrary (or be capable of deriving it), or -- if the user opted in via
+        // --bounded-arguments -- be a supported slice reference,
         // c.f. `autoharness_supported_arg_ty`.
-        // Note that generic functions have been instantiated with concrete types at this point,
-        // so we know that each of these arguments has a concrete type.
+        // Note that we've already filtered out generic functions, so we know that each of these arguments has a concrete type.
         let mut problematic_args = vec![];
+        let mut bounded_args = vec![];
         for (idx, arg) in body.arg_locals().iter().enumerate() {
-            // Do not cache raw pointer types: `ty_arbitrary_cache` stores whether a type
-            // implements (or can derive) Arbitrary, which is false for raw pointers --
-            // `implements_arbitrary` inserts that verdict when it encounters a raw pointer as an
-            // ADT field. Raw pointers are nevertheless supported as harness arguments, so caching
-            // the argument-position verdict under the same key would poison the cache in one
-            // direction or the other (c.f. `autoharness_supported_arg_ty`).
-            let impls_arbitrary = if matches!(arg.ty.kind(), TyKind::RigidTy(RigidTy::RawPtr(..))) {
-                autoharness_supported_arg_ty(arg.ty, kani_any_def, &mut ty_arbitrary_cache)
-            } else {
-                if !ty_arbitrary_cache.contains_key(&arg.ty) {
-                    let supported =
-                        autoharness_supported_arg_ty(arg.ty, kani_any_def, &mut ty_arbitrary_cache);
-                    ty_arbitrary_cache.insert(arg.ty, supported);
-                }
-                *ty_arbitrary_cache.get(&arg.ty).unwrap()
-            };
+            // Note: we deliberately do not insert the verdict into `ty_arbitrary_cache` here.
+            // The cache stores whether a type implements (or can derive) Arbitrary, which is
+            // the wrong semantics for types that are supported in argument position only
+            // (slice references, whose backing storage the harness owns, and BoundedArbitrary
+            // container types): caching the argument-position verdict under the same key
+            // would poison the cache for the ADT-field checks. `implements_arbitrary`
+            // memoizes its own recursion internally, so repeated argument types stay cheap.
+            let support = autoharness_supported_arg_ty(
+                arg.ty,
+                kani_any_def,
+                kani_bounded_any_def,
+                &mut ty_arbitrary_cache,
+            );
 
-            if !impls_arbitrary {
-                // Find the name of the argument by referencing var_debug_info.
-                // Note that enumerate() starts at 0, while rustc_public argument_index starts at 1, hence the idx+1.
-                let arg_name = body
-                    .var_debug_info
-                    .iter()
-                    .find(|var| {
-                        var.argument_index.is_some_and(|arg_idx| idx + 1 == usize::from(arg_idx))
-                    })
-                    .map_or("_".to_string(), |debug_info| debug_info.name.to_string());
-                let arg_type = format!("{}", arg.ty);
-                problematic_args.push((arg_name, arg_type))
+            if support == ArgSupport::Arbitrary {
+                continue;
+            }
+            // Find the name of the argument by referencing var_debug_info.
+            // Note that enumerate() starts at 0, while rustc_public argument_index starts at 1, hence the idx+1.
+            let arg_name = body
+                .var_debug_info
+                .iter()
+                .find(|var| {
+                    var.argument_index.is_some_and(|arg_idx| idx + 1 == usize::from(arg_idx))
+                })
+                .map_or("_".to_string(), |debug_info| debug_info.name.to_string());
+            let arg_type = format!("{}", arg.ty);
+            match support {
+                ArgSupport::Arbitrary => unreachable!(),
+                ArgSupport::Bounded => bounded_args.push((arg_name, arg_type)),
+                ArgSupport::Unsupported => problematic_args.push((arg_name, arg_type)),
             }
         }
         if !problematic_args.is_empty() {
-            return Some(AutoHarnessSkipReason::MissingArbitraryImpl(problematic_args));
+            return Err(AutoHarnessSkipReason::MissingArbitraryImpl(problematic_args));
         }
-        None
+        if !bounded_args.is_empty() && !args.autoharness_bounded_arguments {
+            return Err(AutoHarnessSkipReason::RequiresBoundedArguments(bounded_args));
+        }
+        Ok(!bounded_args.is_empty())
     };
 
     let mut chosen = vec![];
@@ -638,10 +651,12 @@ fn automatic_harness_partition(
             },
         };
 
-        if let Some(reason) = skip_reason(instance) {
-            skipped.insert(crate::kani_middle::strip_local_crate_prefix(instance.name()), reason);
-        } else {
-            chosen.push(instance);
+        match skip_reason(instance) {
+            Err(reason) => {
+                skipped
+                    .insert(crate::kani_middle::strip_local_crate_prefix(instance.name()), reason);
+            }
+            Ok(is_bounded) => chosen.push((instance, is_bounded)),
         }
     }
 
