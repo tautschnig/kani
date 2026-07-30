@@ -229,23 +229,40 @@ fn call_kani_any_for_ty(
 
         // Generate the backing storage: a local holding a nondeterministic array of the
         // element type. Since it is a local of the harness body, it stays alive for the
-        // entire harness.
+        // entire harness. The array is built element-wise (rather than via
+        // `kani::any::<[T; N]>()`) so that element types whose Arbitrary implementation the
+        // compiler derives are supported: each element is generated through the same path as
+        // any other value of that type.
         let bound = if is_str { AUTOHARNESS_STR_BOUND } else { AUTOHARNESS_SLICE_BOUND };
         let storage_ty = Ty::try_new_array(elem_ty, bound).unwrap();
-        let storage_lcl = call_kani_any_for_ty(
-            tcx,
-            kani_any,
-            kani_any_ptr,
-            kani_any_slice_ref,
-            kani_any_str_ref,
-            kani_bounded_any,
-            kani_assume_safe,
-            smart_pointer_models,
-            body,
-            storage_ty,
-            Mutability::Mut,
+        let elem_lcls = (0..bound)
+            .map(|_| {
+                call_kani_any_for_ty(
+                    tcx,
+                    kani_any,
+                    kani_any_ptr,
+                    kani_any_slice_ref,
+                    kani_any_str_ref,
+                    kani_bounded_any,
+                    kani_assume_safe,
+                    smart_pointer_models,
+                    body,
+                    elem_ty,
+                    Mutability::Not,
+                    source,
+                    invariant_cache,
+                )
+            })
+            .collect::<Vec<_>>();
+        let storage_lcl = body.new_local(storage_ty, source.span(body.blocks()), Mutability::Mut);
+        body.assign_to(
+            Place::from(storage_lcl),
+            Rvalue::Aggregate(
+                AggregateKind::Array(elem_ty),
+                elem_lcls.into_iter().map(|lcl| Operand::Move(Place::from(lcl))).collect(),
+            ),
             source,
-            invariant_cache,
+            InsertPosition::Before,
         );
 
         // Pass a mutable reference to the storage to the model, which returns a slice of
@@ -398,6 +415,13 @@ fn call_kani_any_for_ty(
         {
             model_inst
         } else {
+            // `Instance::resolve` does not check trait bounds, so ensure the type actually
+            // implements BoundedArbitrary before emitting the call: an unresolvable
+            // `T::bounded_any` would otherwise only surface as an ICE during reachability.
+            assert!(
+                crate::kani_middle::implements_bounded_arbitrary(tcx, ty, kani_bounded_any),
+                "expected a ty that implements Arbitrary or BoundedArbitrary, got {ty}"
+            );
             Instance::resolve(
                 kani_bounded_any,
                 &GenericArgs(vec![

@@ -311,8 +311,12 @@ fn implements_arbitrary(
 /// So we select the terminator that calls `T::bounded_any::<N>()`, then try to resolve it to an
 /// Instance; `T` implements `BoundedArbitrary` iff we successfully resolve the Instance
 /// (mirroring `implements_arbitrary`).
-fn implements_bounded_arbitrary(ty: Ty, kani_bounded_any_def: FnDef) -> bool {
-    if ty.kind().rigid().is_none() {
+pub(crate) fn implements_bounded_arbitrary(
+    tcx: TyCtxt,
+    ty: Ty,
+    kani_bounded_any_def: FnDef,
+) -> bool {
+    if ty.kind().rigid().is_none() || !ty_is_sized(tcx, ty) {
         return false;
     }
 
@@ -387,6 +391,14 @@ fn implements_invariant(
     res
 }
 
+/// Whether `ty` is statically sized. Nondeterministic-value generation (and the resolution
+/// checks probing for it) must not instantiate generic models with unsized types: apart from
+/// being ungeneratable, this can crash constant evaluation during body retrieval.
+fn ty_is_sized(tcx: TyCtxt, ty: Ty) -> bool {
+    rustc_internal::internal(tcx, ty)
+        .is_sized(*tcx.at(rustc_span::DUMMY_SP), rustc_middle::ty::TypingEnv::fully_monomorphized())
+}
+
 /// The smart-pointer types for which automatic harnesses can generate nondeterministic values
 /// via dedicated (optional) models, c.f. `KaniModel::is_optional`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -424,6 +436,9 @@ fn smart_pointer_pointee(tcx: TyCtxt, ty: Ty) -> Option<(SmartPointerKind, Ty)> 
         GenericArgKind::Type(ty) => Some(*ty),
         _ => None,
     })?;
+    if !ty_is_sized(tcx, pointee) {
+        return None;
+    }
     Some((kind, pointee))
 }
 
@@ -479,7 +494,6 @@ impl SmartPointerModels {
         }
     }
 }
-
 
 /// The formatting traits whose implementations automatic harnesses can verify via dedicated
 /// models (c.f. `KaniModel::CheckDebugFmt`/`CheckDisplayFmt`).
@@ -661,7 +675,7 @@ fn autoharness_supported_arg_ty(
             // Smart pointers of (implementable or derivable) pointees cover exactly the values
             // of the pointee, so they are ordinary (non-bounded) support.
             ArgSupport::Arbitrary
-        } else if implements_bounded_arbitrary(ty, kani_bounded_any_def) {
+        } else if implements_bounded_arbitrary(tcx, ty, kani_bounded_any_def) {
             ArgSupport::Bounded
         } else {
             ArgSupport::Unsupported

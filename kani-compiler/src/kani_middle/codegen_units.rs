@@ -18,8 +18,6 @@ use crate::kani_middle::stubbing::{check_compatibility, harness_stub_map};
 use crate::kani_middle::{
     ArgSupport, SmartPointerModels, autoharness_supported_arg_ty, fmt_impl_self_ty,
 };
-use rustc_infer::infer::TyCtxtInferExt;
-use rustc_trait_selection::traits::{Obligation, ObligationCause, ObligationCtxt};
 use crate::kani_queries::QueryDb;
 use kani_metadata::{
     ArtifactType, AssignsContract, AutoHarnessMetadata, AutoHarnessSkipReason, HarnessMetadata,
@@ -28,6 +26,7 @@ use kani_metadata::{
 use regex::RegexSet;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
+use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::ty::{self, TyCtxt, TypingMode};
 use rustc_public::mir::mono::Instance;
 use rustc_public::rustc_internal;
@@ -38,6 +37,7 @@ use rustc_public::ty::{
 use rustc_public::{CrateDef, CrateItem};
 use rustc_public_bridge::IndexedVal;
 use rustc_session::config::OutputType;
+use rustc_trait_selection::traits::{Obligation, ObligationCause, ObligationCtxt};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::BufWriter;
