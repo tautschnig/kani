@@ -174,6 +174,13 @@ execution.
 
 Nested slice references (e.g. `&&[u8]`) and slices inside user-defined types remain unsupported.
 
+## Debug and Display Implementations
+For the `fmt` methods of `Debug` and `Display` implementations, the `&mut Formatter` argument
+cannot be generated nondeterministically. Instead, Kani generates a harness that formats a
+nondeterministic value of the implementing type into a sink that discards the output: the
+`Formatter` is constructed by the core formatting machinery (so it is always valid), and panics
+or undefined behavior inside the `fmt` implementation are detected as usual.
+
 ## Limitations
 ### Arguments Implementing Arbitrary
 Kani will only generate an automatic harness for a function if it can represent each of its arguments nondeterministically, without bounds.

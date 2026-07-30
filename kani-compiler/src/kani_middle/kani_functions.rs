@@ -83,6 +83,10 @@ pub enum KaniModel {
     AnyBox,
     #[strum(serialize = "AnyRcModel")]
     AnyRc,
+    #[strum(serialize = "CheckDebugFmtModel")]
+    CheckDebugFmt,
+    #[strum(serialize = "CheckDisplayFmtModel")]
+    CheckDisplayFmt,
     #[strum(serialize = "CopyInitStateModel")]
     CopyInitState,
     #[strum(serialize = "CopyInitStateSingleModel")]

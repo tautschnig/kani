@@ -15,7 +15,9 @@ use crate::kani_middle::metadata::{
 };
 use crate::kani_middle::reachability::filter_crate_items;
 use crate::kani_middle::stubbing::{check_compatibility, harness_stub_map};
-use crate::kani_middle::{ArgSupport, SmartPointerModels, autoharness_supported_arg_ty};
+use crate::kani_middle::{
+    ArgSupport, SmartPointerModels, autoharness_supported_arg_ty, fmt_impl_self_ty,
+};
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_trait_selection::traits::{Obligation, ObligationCause, ObligationCtxt};
 use crate::kani_queries::QueryDb;
@@ -572,6 +574,31 @@ fn automatic_harness_partition(
 
         if autoharness_filtered_out(&name, &included_set, &excluded_set) {
             return Err(AutoHarnessSkipReason::UserFilter);
+        }
+
+        // Debug/Display fmt implementations are handled specially: their `&mut Formatter`
+        // argument cannot be generated, but the generated harness formats a nondeterministic
+        // value of the self type into a discarding sink instead,
+        // c.f. `fmt_impl_self_ty`.
+        if let Some((_, self_ty)) = fmt_impl_self_ty(tcx, instance) {
+            return match autoharness_supported_arg_ty(
+                tcx,
+                self_ty,
+                kani_any_def,
+                kani_bounded_any_def,
+                &smart_pointer_models,
+                &mut ty_arbitrary_cache,
+            ) {
+                ArgSupport::Arbitrary => Ok(false),
+                // Only unbounded self values keep the fmt harness's full-coverage meaning;
+                // treat bounded-only support as unsupported for now.
+                ArgSupport::Bounded | ArgSupport::Unsupported => {
+                    Err(AutoHarnessSkipReason::MissingArbitraryImpl(vec![(
+                        "self".to_string(),
+                        format!("{self_ty}"),
+                    )]))
+                }
+            };
         }
 
         // Each argument of `instance` must be supported by automatic harness generation, i.e.,
