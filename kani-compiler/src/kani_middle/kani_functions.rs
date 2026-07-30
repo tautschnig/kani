@@ -77,6 +77,12 @@ pub enum KaniModel {
     AnyStrRef,
     #[strum(serialize = "BoundedAnyModel")]
     BoundedAny,
+    #[strum(serialize = "AnyArcModel")]
+    AnyArc,
+    #[strum(serialize = "AnyBoxModel")]
+    AnyBox,
+    #[strum(serialize = "AnyRcModel")]
+    AnyRc,
     #[strum(serialize = "CopyInitStateModel")]
     CopyInitState,
     #[strum(serialize = "CopyInitStateSingleModel")]
@@ -170,6 +176,15 @@ pub enum KaniHook {
     UnsupportedCheck,
     #[strum(serialize = "UntrackedDerefHook")]
     UntrackedDeref,
+}
+
+impl KaniModel {
+    /// Whether this model may legitimately be absent. The smart-pointer models require `alloc`
+    /// and are only defined in the `kani` library, not in `core::kani` (the `no_core` flow used
+    /// by `kani verify-std`). Code retrieving optional models must handle their absence.
+    pub fn is_optional(&self) -> bool {
+        matches!(self, KaniModel::AnyArc | KaniModel::AnyBox | KaniModel::AnyRc)
+    }
 }
 
 impl From<KaniIntrinsic> for KaniFunction {
@@ -281,7 +296,7 @@ pub fn validate_kani_functions(kani_funcs: &HashMap<KaniFunction, FnDef>) {
     {
         if let Some(fn_def) = kani_funcs.get(&func) {
             assert_eq!(KaniFunction::try_from(*fn_def), Ok(func), "Unexpected function marker");
-        } else {
+        } else if !matches!(func, KaniFunction::Model(model) if model.is_optional()) {
             tracing::error!(?func, "Missing kani function");
             missing += 1;
         }

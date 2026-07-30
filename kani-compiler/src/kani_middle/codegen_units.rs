@@ -15,7 +15,7 @@ use crate::kani_middle::metadata::{
 };
 use crate::kani_middle::reachability::filter_crate_items;
 use crate::kani_middle::stubbing::{check_compatibility, harness_stub_map};
-use crate::kani_middle::{ArgSupport, autoharness_supported_arg_ty};
+use crate::kani_middle::{ArgSupport, SmartPointerModels, autoharness_supported_arg_ty};
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_trait_selection::traits::{Obligation, ObligationCause, ObligationCtxt};
 use crate::kani_queries::QueryDb;
@@ -109,6 +109,7 @@ impl CodegenUnits {
                     &crate_info.name,
                     *kani_fns.get(&KaniModel::Any.into()).unwrap(),
                     *kani_fns.get(&KaniModel::BoundedAny.into()).unwrap(),
+                    SmartPointerModels::from_kani_functions(kani_fns),
                 );
                 AUTOHARNESS_MD
                     .set(AutoHarnessMetadata {
@@ -524,6 +525,7 @@ fn automatic_harness_partition(
     crate_name: &str,
     kani_any_def: FnDef,
     kani_bounded_any_def: FnDef,
+    smart_pointer_models: SmartPointerModels,
 ) -> (Vec<(Instance, bool)>, BTreeMap<String, AutoHarnessSkipReason>) {
     let crate_fn_defs = rustc_public::local_crate().fn_defs().into_iter().collect::<FxHashSet<_>>();
     // Filter out CrateItems that are functions, but not functions defined in the crate itself, i.e., rustc-inserted functions
@@ -573,10 +575,16 @@ fn automatic_harness_partition(
         }
 
         // Each argument of `instance` must be supported by automatic harness generation, i.e.,
-        // implement Arbitrary (or be capable of deriving it), or -- if the user opted in via
-        // --bounded-arguments -- be a supported slice reference,
+        // implement Arbitrary (or be capable of deriving it), be a supported smart pointer or
+        // raw pointer, or -- if the user opted in via --bounded-arguments -- be a supported
+        // slice reference or BoundedArbitrary type,
         // c.f. `autoharness_supported_arg_ty`.
         // Note that we've already filtered out generic functions, so we know that each of these arguments has a concrete type.
+        // We deliberately do not insert the verdict into `ty_arbitrary_cache` here: the cache
+        // stores whether a type implements (or can derive) Arbitrary, which is the wrong
+        // semantics for types that are supported in argument position only (smart pointers of
+        // derivable pointees); `implements_arbitrary` memoizes its own recursion internally,
+        // so repeated argument types stay cheap.
         let mut problematic_args = vec![];
         let mut bounded_args = vec![];
         for (idx, arg) in body.arg_locals().iter().enumerate() {
@@ -588,9 +596,11 @@ fn automatic_harness_partition(
             // would poison the cache for the ADT-field checks. `implements_arbitrary`
             // memoizes its own recursion internally, so repeated argument types stay cheap.
             let support = autoharness_supported_arg_ty(
+                tcx,
                 arg.ty,
                 kani_any_def,
                 kani_bounded_any_def,
+                &smart_pointer_models,
                 &mut ty_arbitrary_cache,
             );
 
