@@ -2,4 +2,4 @@
 # Copyright Kani Contributors
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 
-cargo kani autoharness -Z autoharness -Z function-contracts -Z mem-predicates
+cargo kani autoharness -Z autoharness --output-format=regular -Z function-contracts -Z mem-predicates
