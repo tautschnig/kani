@@ -24,9 +24,9 @@ use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
     AggregateKind, BasicBlock, BasicBlockIdx, BinOp, Body, BorrowKind, CastKind, ConstOperand,
-    Local, LocalDecl, MutBorrowKind, Mutability, NonDivergingIntrinsic, Operand, Place,
-    ProjectionElem, Rvalue, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind,
-    UnOp, UnwindAction,
+    Local, MutBorrowKind, Mutability, NonDivergingIntrinsic, Operand, Place, ProjectionElem,
+    Rvalue, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind, UnOp,
+    UnwindAction,
 };
 use rustc_public::ty::{
     AdtDef, AdtKind, FnDef, GenericArgKind, GenericArgs, MirConst, Region, RegionKind, RigidTy, Ty,
@@ -322,30 +322,28 @@ fn remap_block(bb: &mut BasicBlock, local_map: &[Local], block_offset: usize) ->
     true
 }
 
-/// Whether `func` resolves to a panic entry point.
-fn is_panic_call(tcx: TyCtxt, func: &Operand, locals: &[LocalDecl]) -> bool {
-    let Ok(fn_ty) = func.ty(locals) else { return false };
-    let TyKind::RigidTy(RigidTy::FnDef(def, _)) = fn_ty.kind() else { return false };
-    let def_id = rustc_public::rustc_internal::internal(tcx, def.def_id());
-    Some(def_id) == tcx.lang_items().panic_fn()
-        || Some(def_id) == tcx.lang_items().panic_fmt()
-        || Some(def_id) == tcx.lang_items().begin_panic_fn()
-        || def.name().starts_with("core::panicking::")
-}
-
 /// C14 (assert mining, dynamic form): inline `callee`'s monomorphic body into `body` at
-/// `source`, with every panic path converted into `kani::assume(false)`. Calling an
-/// assert-guarded representation constructor (e.g. time's `Date::from_parts`, whose
-/// debug_asserts state the type's validity contract) with nondeterministic arguments then
-/// yields exactly the values that pass the type's own validity assertions: the assertions
-/// act as filters instead of failures. MIR `Assert` terminators (overflow checks etc.) are
-/// likewise converted into assumptions, so argument combinations that make the constructor
-/// itself misbehave do not produce values.
+/// `source`, with every validity statement converted into a filter on the nondeterministic
+/// inputs:
+/// - `kani::assert(cond, msg)` calls (Kani's macro overrides have already rewritten user
+///   asserts/panics into these) become `kani::assume(cond)`;
+/// - `hint::assert_unchecked(cond)` calls (UB-hint contracts, e.g. deranged's
+///   `new_unchecked`) become `kani::assume(cond)`;
+/// - raw panic-entry calls become `assume(false); unreachable`;
+/// - MIR `Assert` terminators (overflow checks) become `assume(cond == expected)`.
+///
+/// Calls *within* the inlined body whose callees themselves contain such validity statements
+/// (e.g. time's `Time::__from_hms_nanos_unchecked` calling deranged's `new_unchecked`) are
+/// recursively inlined, up to [INLINE_MAX_DEPTH] levels and [INLINE_MAX_BLOCKS] blocks per
+/// callee; other calls are kept as plain calls.
 ///
 /// `arg_locals` must hold fully-initialized constructor arguments. Returns the local holding
-/// the constructed value, or None (caller falls back to a plain call) if the callee body
-/// contains unsupported constructs. Only `body.locals` will have been extended in that case
-/// (the unused locals are harmless).
+/// the constructed value, or None (caller falls back to a plain call) if the outer callee
+/// body contains unsupported constructs. (A bail-out mid-way leaves only unused locals
+/// behind, which is harmless.)
+const INLINE_MAX_DEPTH: usize = 3;
+const INLINE_MAX_BLOCKS: usize = 32;
+
 fn inline_with_assumed_panics(
     tcx: TyCtxt,
     kani_assume: FnDef,
@@ -358,10 +356,233 @@ fn inline_with_assumed_panics(
 ) -> Option<Local> {
     let callee_body = callee.body()?;
     let span = source.span(body.blocks());
-
-    // Map callee locals into the caller: _0 -> fresh return local, _1..=argc -> arg_locals,
-    // the rest -> fresh locals.
     let ret_lcl = body.new_local(ret_ty, span, Mutability::Mut);
+
+    // All blocks from `block_offset` onward are planned into `planned`; slots are allocated
+    // (possibly ahead of being filled) so that nested inlining can interleave with the outer
+    // walk without breaking target indices.
+    let continuation = body.blocks().len();
+    let block_offset = continuation + 1;
+    let assume_inst = Instance::resolve(kani_assume, &GenericArgs(vec![])).unwrap();
+
+    struct Ctx<'tcx, 'a> {
+        tcx: TyCtxt<'tcx>,
+        kani_assert: FnDef,
+        assume_inst: Instance,
+        body: &'a mut MutableBody,
+        planned: Vec<Option<BasicBlock>>,
+        block_offset: usize,
+        span: rustc_public::ty::Span,
+    }
+
+    impl Ctx<'_, '_> {
+        fn alloc(&mut self, n: usize) -> usize {
+            let base = self.block_offset + self.planned.len();
+            self.planned.extend(std::iter::repeat_with(|| None).take(n));
+            base
+        }
+
+        fn set(&mut self, idx: usize, bb: BasicBlock) {
+            self.planned[idx - self.block_offset] = Some(bb);
+        }
+
+        fn assume_call_terminator(
+            &mut self,
+            cond: Operand,
+            target: BasicBlockIdx,
+        ) -> TerminatorKind {
+            let func_lcl = self.body.new_local(self.assume_inst.ty(), self.span, Mutability::Not);
+            let unit_lcl = self.body.new_local(Ty::new_tuple(&[]), self.span, Mutability::Mut);
+            TerminatorKind::Call {
+                func: Operand::Copy(Place::from(func_lcl)),
+                args: vec![cond],
+                destination: Place::from(unit_lcl),
+                target: Some(target),
+                unwind: UnwindAction::Terminate,
+            }
+        }
+
+        /// Does `fn_body` directly contain a validity statement worth mining?
+        fn worth_inlining(&self, fn_body: &Body) -> bool {
+            fn_body.blocks.iter().any(|bb| match &bb.terminator.kind {
+                TerminatorKind::Assert { .. } => true,
+                TerminatorKind::Call { func, .. } => {
+                    match func.ty(fn_body.locals()).map(|t| t.kind()) {
+                        Ok(TyKind::RigidTy(RigidTy::FnDef(def, _))) => {
+                            def == self.kani_assert
+                                || def.name().contains("assert_unchecked")
+                                || is_panic_def(self.tcx, def)
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            })
+        }
+
+        /// Plan `fn_body` (of `n` blocks) into slots `base..base+n`, remapping via
+        /// `local_map`, converting validity statements, recursively inlining qualifying
+        /// callees. Returns false to bail out (unsupported construct at depth 0; at deeper
+        /// levels callers pre-check with `worth_inlining` and blocks are conservative).
+        fn plan_body(
+            &mut self,
+            fn_body: &Body,
+            local_map: &[Local],
+            base: usize,
+            ret_target: BasicBlockIdx,
+            depth: usize,
+        ) -> bool {
+            for (i, callee_bb) in fn_body.blocks.iter().enumerate() {
+                let mut bb = callee_bb.clone();
+                if !remap_block(&mut bb, local_map, base) {
+                    return false;
+                }
+                match &mut bb.terminator.kind {
+                    TerminatorKind::Return => {
+                        bb.terminator.kind = TerminatorKind::Goto { target: ret_target };
+                    }
+                    TerminatorKind::Resume | TerminatorKind::Abort => {
+                        bb.terminator.kind = TerminatorKind::Unreachable;
+                    }
+                    TerminatorKind::Assert { cond, expected, target, .. } => {
+                        let (cond, expected, target) = (cond.clone(), *expected, *target);
+                        let cond_lcl =
+                            self.body.new_local(Ty::bool_ty(), self.span, Mutability::Mut);
+                        let rv = if expected {
+                            Rvalue::Use(cond)
+                        } else {
+                            Rvalue::UnaryOp(UnOp::Not, cond)
+                        };
+                        bb.statements.push(Statement {
+                            kind: StatementKind::Assign(Place::from(cond_lcl), rv),
+                            span: self.span,
+                        });
+                        bb.terminator.kind = self
+                            .assume_call_terminator(Operand::Move(Place::from(cond_lcl)), target);
+                    }
+                    TerminatorKind::Call { func, args, destination, target, .. } => {
+                        let fn_def = match func.ty(self.body.locals()).map(|t| t.kind()) {
+                            Ok(TyKind::RigidTy(RigidTy::FnDef(def, fn_args))) => {
+                                Some((def, fn_args))
+                            }
+                            _ => None,
+                        };
+                        if let Some((def, _)) = &fn_def
+                            && (*def == self.kani_assert || def.name().contains("assert_unchecked"))
+                        {
+                            // kani::assert(cond, msg) / assert_unchecked(cond) -> assume(cond)
+                            let cond = args[0].clone();
+                            let target = target.expect("assert has a return target");
+                            bb.terminator.kind = self.assume_call_terminator(cond, target);
+                        } else if let Some((def, _)) = &fn_def
+                            && is_panic_def(self.tcx, *def)
+                        {
+                            // panic -> assume(false); unreachable
+                            let unreach = self.alloc(1);
+                            self.set(
+                                unreach,
+                                BasicBlock {
+                                    statements: vec![],
+                                    terminator: Terminator {
+                                        kind: TerminatorKind::Unreachable,
+                                        span: self.span,
+                                    },
+                                },
+                            );
+                            let false_op = Operand::Constant(ConstOperand {
+                                span: self.span,
+                                user_ty: None,
+                                const_: MirConst::from_bool(false),
+                            });
+                            bb.terminator.kind = self.assume_call_terminator(false_op, unreach);
+                        } else if depth < INLINE_MAX_DEPTH
+                            && let Some((def, fn_args)) = &fn_def
+                            && let Ok(inst) = Instance::resolve(*def, fn_args)
+                            && let Some(inner_body) = inst.body()
+                            && inner_body.blocks.len() <= INLINE_MAX_BLOCKS
+                            && self.worth_inlining(&inner_body)
+                        {
+                            // Recursively inline: materialize args into fresh locals,
+                            // stitch the return value into the call's destination.
+                            let target = target.expect("inlined callee has a return target");
+                            let inner_ret_ty = inner_body.locals()[0].ty;
+                            let inner_ret_lcl =
+                                self.body.new_local(inner_ret_ty, self.span, Mutability::Mut);
+                            let mut inner_map = vec![inner_ret_lcl];
+                            for (arg_op, decl) in args.iter().zip(inner_body.arg_locals().iter()) {
+                                let a = self.body.new_local(decl.ty, self.span, Mutability::Mut);
+                                bb.statements.push(Statement {
+                                    kind: StatementKind::Assign(
+                                        Place::from(a),
+                                        Rvalue::Use(arg_op.clone()),
+                                    ),
+                                    span: self.span,
+                                });
+                                inner_map.push(a);
+                            }
+                            for decl in inner_body.locals().iter().skip(1 + args.len()) {
+                                inner_map.push(self.body.new_local(
+                                    decl.ty,
+                                    self.span,
+                                    Mutability::Mut,
+                                ));
+                            }
+                            let stitch = self.alloc(1);
+                            let inner_base = self.alloc(inner_body.blocks.len());
+                            self.set(
+                                stitch,
+                                BasicBlock {
+                                    statements: vec![Statement {
+                                        kind: StatementKind::Assign(
+                                            destination.clone(),
+                                            Rvalue::Use(Operand::Move(Place::from(inner_ret_lcl))),
+                                        ),
+                                        span: self.span,
+                                    }],
+                                    terminator: Terminator {
+                                        kind: TerminatorKind::Goto { target },
+                                        span: self.span,
+                                    },
+                                },
+                            );
+                            if self.plan_body(
+                                &inner_body,
+                                &inner_map,
+                                inner_base,
+                                stitch,
+                                depth + 1,
+                            ) {
+                                bb.terminator.kind = TerminatorKind::Goto { target: inner_base };
+                            } else {
+                                // Nested bail-out: keep the plain call; fill the reserved
+                                // slots with unreachable stubs (never targeted).
+                                for j in 0..inner_body.blocks.len() {
+                                    if self.planned[inner_base + j - self.block_offset].is_none() {
+                                        self.set(
+                                            inner_base + j,
+                                            BasicBlock {
+                                                statements: vec![],
+                                                terminator: Terminator {
+                                                    kind: TerminatorKind::Unreachable,
+                                                    span: self.span,
+                                                },
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        // else: keep the plain (already remapped) call.
+                    }
+                    _ => {}
+                }
+                self.set(base + i, bb);
+            }
+            true
+        }
+    }
+
+    // Map callee locals: _0 -> ret_lcl, _1..=argc -> arg_locals, rest -> fresh.
     let mut local_map: Vec<Local> = Vec::with_capacity(callee_body.locals().len());
     local_map.push(ret_lcl);
     let argc = callee_body.arg_locals().len();
@@ -371,140 +592,30 @@ fn inline_with_assumed_panics(
         local_map.push(body.new_local(decl.ty, span, Mutability::Mut));
     }
 
-    // The caller will be split at `source`; the remainder (continuation) block index and the
-    // appended blocks' indices are all known up front:
-    //   [0..len)           existing blocks (after split: +1 for the remainder)
-    //   len                continuation (remainder of the split block)
-    //   len+1 .. len+1+N   remapped callee blocks (callee block i -> len+1+i)
-    //   len+1+N ..         unreachable blocks for panic rewrites
-    let continuation = body.blocks().len();
-    let block_offset = continuation + 1;
-    let n_callee = callee_body.blocks.len();
-    let assume_inst = Instance::resolve(kani_assume, &GenericArgs(vec![])).unwrap();
-
-    // Pass 1: build all remapped blocks (no body.blocks mutation yet; bail-out is clean).
-    let mut new_blocks: Vec<BasicBlock> = Vec::with_capacity(n_callee);
-    let mut n_unreach = 0usize;
-    for callee_bb in callee_body.blocks.iter() {
-        let mut bb = callee_bb.clone();
-        if !remap_block(&mut bb, &local_map, block_offset) {
-            return None;
-        }
-        match &mut bb.terminator.kind {
-            TerminatorKind::Return => {
-                bb.terminator.kind = TerminatorKind::Goto { target: continuation };
-            }
-            TerminatorKind::Resume | TerminatorKind::Abort => {
-                bb.terminator.kind = TerminatorKind::Unreachable;
-            }
-            TerminatorKind::Assert { cond, expected, target, .. } => {
-                // assume(cond == expected); goto target
-                let (cond, expected, target) = (cond.clone(), *expected, *target);
-                let cond_lcl = body.new_local(Ty::bool_ty(), span, Mutability::Mut);
-                let rv =
-                    if expected { Rvalue::Use(cond) } else { Rvalue::UnaryOp(UnOp::Not, cond) };
-                bb.statements.push(Statement {
-                    kind: StatementKind::Assign(Place::from(cond_lcl), rv),
-                    span,
-                });
-                let func_lcl = body.new_local(assume_inst.ty(), span, Mutability::Not);
-                let unit_lcl = body.new_local(Ty::new_tuple(&[]), span, Mutability::Mut);
-                bb.terminator.kind = TerminatorKind::Call {
-                    func: Operand::Copy(Place::from(func_lcl)),
-                    args: vec![Operand::Move(Place::from(cond_lcl))],
-                    destination: Place::from(unit_lcl),
-                    target: Some(target),
-                    unwind: UnwindAction::Terminate,
-                };
-            }
-            // Kani's macro overrides have already rewritten user panics/asserts into
-            // kani::assert(cond, msg) calls: convert those into kani::assume(cond), which is
-            // precisely the mining conversion (the assert condition becomes a filter).
-            TerminatorKind::Call { func, args, target, .. }
-                if func.ty(body.locals()).is_ok_and(|fn_ty| {
-                    matches!(fn_ty.kind(),
-                        TyKind::RigidTy(RigidTy::FnDef(def, _)) if def == kani_assert)
-                }) =>
-            {
-                let cond = args[0].clone();
-                let target = target.expect("kani::assert has a return target");
-                let func_lcl = body.new_local(assume_inst.ty(), span, Mutability::Not);
-                let unit_lcl = body.new_local(Ty::new_tuple(&[]), span, Mutability::Mut);
-                bb.terminator.kind = TerminatorKind::Call {
-                    func: Operand::Copy(Place::from(func_lcl)),
-                    args: vec![cond],
-                    destination: Place::from(unit_lcl),
-                    target: Some(target),
-                    unwind: UnwindAction::Terminate,
-                };
-            }
-            // hint::assert_unchecked states a validity contract as a UB-hint (deranged's
-            // new_unchecked). Within an inlined generator it becomes a filter, like the
-            // asserts; without this rewrite Kani checks it and reports "Rust intrinsic
-            // assumption failed" for out-of-range generated arguments.
-            TerminatorKind::Call { func, args, target, .. }
-                if func.ty(body.locals()).is_ok_and(|fn_ty| {
-                    matches!(fn_ty.kind(),
-                        TyKind::RigidTy(RigidTy::FnDef(def, _))
-                            if def.name().contains("assert_unchecked"))
-                }) =>
-            {
-                let cond = args[0].clone();
-                let target = target.expect("assert_unchecked has a return target");
-                let func_lcl = body.new_local(assume_inst.ty(), span, Mutability::Not);
-                let unit_lcl = body.new_local(Ty::new_tuple(&[]), span, Mutability::Mut);
-                bb.terminator.kind = TerminatorKind::Call {
-                    func: Operand::Copy(Place::from(func_lcl)),
-                    args: vec![cond],
-                    destination: Place::from(unit_lcl),
-                    target: Some(target),
-                    unwind: UnwindAction::Terminate,
-                };
-            }
-            TerminatorKind::Call { func, .. } if is_panic_call(tcx, func, body.locals()) => {
-                // assume(false); unreachable
-                let false_lcl = body.new_local(Ty::bool_ty(), span, Mutability::Mut);
-                bb.statements.push(Statement {
-                    kind: StatementKind::Assign(
-                        Place::from(false_lcl),
-                        Rvalue::Use(Operand::Constant(ConstOperand {
-                            span,
-                            user_ty: None,
-                            const_: MirConst::from_bool(false),
-                        })),
-                    ),
-                    span,
-                });
-                let func_lcl = body.new_local(assume_inst.ty(), span, Mutability::Not);
-                let unit_lcl = body.new_local(Ty::new_tuple(&[]), span, Mutability::Mut);
-                bb.terminator.kind = TerminatorKind::Call {
-                    func: Operand::Copy(Place::from(func_lcl)),
-                    args: vec![Operand::Move(Place::from(false_lcl))],
-                    destination: Place::from(unit_lcl),
-                    target: Some(block_offset + n_callee + n_unreach),
-                    unwind: UnwindAction::Terminate,
-                };
-                n_unreach += 1;
-            }
-            _ => {}
-        }
-        new_blocks.push(bb);
+    let mut ctx = Ctx { tcx, kani_assert, assume_inst, body, planned: vec![], block_offset, span };
+    let outer_base = ctx.alloc(callee_body.blocks.len());
+    if !ctx.plan_body(&callee_body, &local_map, outer_base, continuation, 0) {
+        return None;
     }
+    let planned = ctx.planned;
 
-    // Pass 2: split the caller and append everything at the precomputed indices.
-    let placeholder = Terminator { kind: TerminatorKind::Goto { target: block_offset }, span };
+    // Commit: split the caller and append all planned blocks at their precomputed indices.
+    let placeholder = Terminator { kind: TerminatorKind::Goto { target: outer_base }, span };
     let (_goto_bb, actual_continuation) = body.split_with_terminator(source, placeholder);
     assert_eq!(actual_continuation, continuation);
-    for bb in new_blocks {
-        body.push_raw_bb(bb);
-    }
-    for _ in 0..n_unreach {
-        body.push_raw_bb(BasicBlock {
-            statements: vec![],
-            terminator: Terminator { kind: TerminatorKind::Unreachable, span },
-        });
+    for bb in planned {
+        body.push_raw_bb(bb.expect("all planned slots must be filled"));
     }
     Some(ret_lcl)
+}
+
+/// Whether `def` is a panic entry point.
+fn is_panic_def(tcx: TyCtxt, def: FnDef) -> bool {
+    let def_id = rustc_public::rustc_internal::internal(tcx, def.def_id());
+    Some(def_id) == tcx.lang_items().panic_fn()
+        || Some(def_id) == tcx.lang_items().panic_fmt()
+        || Some(def_id) == tcx.lang_items().begin_panic_fn()
+        || def.name().starts_with("core::panicking::")
 }
 
 /// If `ty` has a scalar layout with a restricted valid range (a niche), append
