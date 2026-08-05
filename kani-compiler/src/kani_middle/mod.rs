@@ -391,6 +391,41 @@ fn implements_invariant(
     res
 }
 
+/// The niche constraint of a scalar-ABI type: the unsigned integer type that holds the
+/// scalar's bits, and the (possibly wrapping) inclusive range of valid bit patterns.
+/// Returns None for non-scalar ABIs, pointer/float scalars, and scalars whose valid range
+/// covers every bit pattern.
+///
+/// Rationale (C14-P1): a layout niche is a language-level validity invariant (rustc uses it
+/// for enum packing), so a synthesized `kani::any` body must not produce values outside it —
+/// they are as invalid as a `bool` holding 3. Assuming the range is therefore sound and
+/// requires no reporting caveat.
+pub struct ScalarNiche {
+    /// Width of the scalar in bits (8, 16, 32, 64 or 128).
+    pub bits: u64,
+    /// Inclusive start of the valid range (bit pattern).
+    pub start: u128,
+    /// Inclusive end of the valid range (bit pattern). If `end < start`, the range wraps.
+    pub end: u128,
+}
+
+pub fn scalar_niche(tcx: TyCtxt, ty: Ty) -> Option<ScalarNiche> {
+    use rustc_abi::{BackendRepr, Primitive, Scalar};
+    let internal_ty = rustc_internal::internal(tcx, ty);
+    let layout = tcx
+        .layout_of(rustc_middle::ty::TypingEnv::fully_monomorphized().as_query_input(internal_ty))
+        .ok()?;
+    let BackendRepr::Scalar(scalar) = layout.backend_repr else { return None };
+    let Scalar::Initialized { value, valid_range } = scalar else { return None };
+    let Primitive::Int(int, _signed) = value else { return None };
+    let bits = int.size().bits();
+    let full = if bits == 128 { u128::MAX } else { (1u128 << bits) - 1 };
+    if valid_range.start == 0 && valid_range.end == full {
+        return None;
+    }
+    Some(ScalarNiche { bits, start: valid_range.start, end: valid_range.end })
+}
+
 /// Whether `ty` is statically sized. Nondeterministic-value generation (and the resolution
 /// checks probing for it) must not instantiate generic models with unsized types: apart from
 /// being ungeneratable, this can crash constant evaluation during body retrieval.
