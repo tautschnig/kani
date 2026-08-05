@@ -1,4 +1,4 @@
-Kani generated automatic harnesses for 48 function(s):
+Kani generated automatic harnesses for 49 function(s):
 +--------------------------+----------------------------------------------+
 | Crate                    | Selected Function                            |
 +=========================================================================+
@@ -99,7 +99,7 @@ Kani generated automatic harnesses for 48 function(s):
 | cargo_autoharness_filter | yes_harness::f_usize                         |
 +--------------------------+----------------------------------------------+
 
-Kani did not generate automatic harnesses for 3 function(s).
+Kani did not generate automatic harnesses for 2 function(s).
 If you believe that the provided reason is incorrect and Kani should have generated an automatic harness, please comment on this issue: https://github.com/model-checking/kani/issues/3832
 +--------------------------+----------------------------------------+----------------------------------------------------------------------------------+
 | Crate                    | Skipped Function                       | Reason for Skipping                                                              |
@@ -108,7 +108,6 @@ If you believe that the provided reason is incorrect and Kani should have genera
 |--------------------------+----------------------------------------+----------------------------------------------------------------------------------|
 | cargo_autoharness_filter | no_harness::unsupported_vec            | Requires --bounded-arguments for argument(s) _y: std::vec::Vec<u8>               |
 |--------------------------+----------------------------------------+----------------------------------------------------------------------------------|
-| cargo_autoharness_filter | yes_harness::f_slice                   | Requires --bounded-arguments for argument(s) _y: &[u8]                           |
 +--------------------------+----------------------------------------+----------------------------------------------------------------------------------+
 Autoharness: Checking function no_harness::unsupported_no_arg_name against all possible inputs...
 Autoharness: Checking function no_harness::unsupported_mut_pointer against all possible inputs...
@@ -262,4 +261,4 @@ Autoharness Summary:
 |--------------------------+----------------------------------------------+---------------------------+---------------------|
 | cargo_autoharness_filter | yes_harness::f_usize                         | #[kani::proof]            | Success             |
 +--------------------------+----------------------------------------------+---------------------------+---------------------+
-Complete - 48 successfully verified functions, 0 failures, 48 total.
+Complete - 49 successfully verified functions, 0 failures, 49 total.

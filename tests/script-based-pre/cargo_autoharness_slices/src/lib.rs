@@ -2,12 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 // Test that the autoharness subcommand supports slice reference (`&[T]`, `&mut [T]`) and
-// string slice (`&str`) arguments. The generated harness produces a slice of nondeterministic
-// length, bounded by AUTOHARNESS_SLICE_BOUND (16) for slices and AUTOHARNESS_STR_BOUND (8)
-// for strings, backed by nondeterministic harness-local storage, c.f. the `AnySliceRef` and
-// `AnyStrRef` models. The "TEST NOTE" comments explain the expected result per function.
+// string slice (`&str`) arguments.
+// Immutable slices of qualifying element types (integers/floats, byte-width niched scalars)
+// are generated *unbounded* (`AnySliceRefUnbounded`: a fresh allocation of nondeterministic
+// size with quantified element validity): results hold for ALL lengths, and loops that
+// cannot be fully unwound surface as unwinding-assertion FAILURES rather than silently
+// bounded successes. Mutable slices, other element types, and `&str` use the bounded models
+// (AUTOHARNESS_SLICE_BOUND (16) / AUTOHARNESS_STR_BOUND (8)) and are marked "(bounded)".
+// The "TEST NOTE" comments explain the expected result per function.
 
-// TEST NOTE: should PASS: summing at most 16 u32s cannot overflow u64.
+// TEST NOTE: should FAIL with an unwinding assertion: the slice is unbounded, so the
+// default loop bound cannot cover it — the incompleteness is signaled rather than silent.
 pub fn sum(xs: &[u32]) -> u64 {
     xs.iter().map(|&x| x as u64).sum()
 }
@@ -27,7 +32,8 @@ pub fn zero_all(xs: &mut [u8]) {
 // TEST NOTE: should PASS, and the cover checks must be SATISFIED: nonempty slices of
 // nondeterministic contents and length are generated.
 pub fn slice_cover(xs: &[u8]) {
-    kani::cover!(xs.len() == 16 && xs[0] == 255, "maximum-length slice with nondet contents");
+    kani::cover!(xs.len() == 16 && xs[0] == 255, "length-16 slice with nondet contents");
+    kani::cover!(xs.len() > 100_000, "lengths far beyond any bound");
     kani::cover!(xs.is_empty(), "empty slice");
 }
 

@@ -103,6 +103,16 @@ way are marked "(ctor)" in the output, and their verification results only cover
 reachable through the chosen constructor; a bug that requires a different value will not be
 found.
 
+### Unbounded slice arguments
+
+Immutable slice arguments (`&[T]`) whose element type is an integer, float, `bool`, or a
+byte-width ranged type are generated *unbounded*: a fresh allocation of nondeterministic
+size, with element validity established by a quantified assumption. Verification results for
+such harnesses hold for **all** slice lengths. If the function iterates over the slice and
+the loop cannot be fully unwound within the unwinding bound, the harness fails with an
+unwinding assertion: the incompleteness is signaled, not silent. Other element types,
+mutable slices, and `&str` use bounded generation (below).
+
 ## Example
 Using the `estimate_size` example from [First Steps](../../tutorial-first-steps.md) again:
 ```rust

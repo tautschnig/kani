@@ -111,6 +111,7 @@ impl CodegenUnits {
                     &crate_info.name,
                     *kani_fns.get(&KaniModel::Any.into()).unwrap(),
                     *kani_fns.get(&KaniModel::BoundedAny.into()).unwrap(),
+                    kani_fns.contains_key(&KaniModel::AnySliceRefUnbounded.into()),
                     SmartPointerModels::from_kani_functions(kani_fns),
                 );
                 AUTOHARNESS_MD
@@ -656,6 +657,7 @@ fn automatic_harness_partition(
     crate_name: &str,
     kani_any_def: FnDef,
     kani_bounded_any_def: FnDef,
+    unbounded_slice_available: bool,
     smart_pointer_models: SmartPointerModels,
 ) -> (Vec<(Instance, bool, bool)>, BTreeMap<String, AutoHarnessSkipReason>) {
     let crate_fn_defs = rustc_public::local_crate().fn_defs().into_iter().collect::<FxHashSet<_>>();
@@ -715,6 +717,7 @@ fn automatic_harness_partition(
                 self_ty,
                 kani_any_def,
                 kani_bounded_any_def,
+                unbounded_slice_available,
                 &smart_pointer_models,
                 &mut ty_arbitrary_cache,
             ) {
@@ -756,6 +759,7 @@ fn automatic_harness_partition(
                 arg.ty,
                 kani_any_def,
                 kani_bounded_any_def,
+                unbounded_slice_available,
                 &smart_pointer_models,
                 &mut ty_arbitrary_cache,
             );

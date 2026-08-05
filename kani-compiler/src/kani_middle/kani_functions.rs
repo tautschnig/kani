@@ -73,6 +73,8 @@ pub enum KaniModel {
     AssumeSafe,
     #[strum(serialize = "AnySliceRefModel")]
     AnySliceRef,
+    #[strum(serialize = "AnySliceRefUnboundedModel")]
+    AnySliceRefUnbounded,
     #[strum(serialize = "AnyStrRefModel")]
     AnyStrRef,
     #[strum(serialize = "BoundedAnyModel")]
@@ -149,6 +151,8 @@ pub enum KaniHook {
     AnyRaw,
     #[strum(serialize = "AssertHook")]
     Assert,
+    #[strum(serialize = "SliceValidityAssumeHook")]
+    SliceValidityAssume,
     #[strum(serialize = "AssumeHook")]
     Assume,
     #[strum(serialize = "CheckHook")]
@@ -187,7 +191,13 @@ impl KaniModel {
     /// and are only defined in the `kani` library, not in `core::kani` (the `no_core` flow used
     /// by `kani verify-std`). Code retrieving optional models must handle their absence.
     pub fn is_optional(&self) -> bool {
-        matches!(self, KaniModel::AnyArc | KaniModel::AnyBox | KaniModel::AnyRc)
+        matches!(
+            self,
+            KaniModel::AnyArc
+                | KaniModel::AnyBox
+                | KaniModel::AnyRc
+                | KaniModel::AnySliceRefUnbounded
+        )
     }
 }
 

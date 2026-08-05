@@ -391,6 +391,37 @@ fn implements_invariant(
     res
 }
 
+/// Whether `&[T]` arguments with this element type qualify for *unbounded* generation
+/// (`KaniModel::AnySliceRefUnbounded`): raw nondeterministic memory must be a sound and
+/// complete model of the element's values, given the validity assumption the
+/// `SliceValidityAssume` hook can express (byte-granularity predicates only):
+/// - types without a layout niche whose every bit pattern is valid (integers, floats);
+/// - 8-bit niched scalars (bool, u8-based ranged types);
+/// - NonZero-style niches (zero excluded, full top) of any width, via bytewise "some byte
+///   nonzero".
+/// `char` is explicitly excluded: its layout niche (0..=0x10FFFF) does not capture the
+/// surrogate hole, so a niche assumption would still generate invalid values. Wider general
+/// ranges (e.g. deranged's RangedU32) are not byte-decomposable and use the bounded path.
+pub fn slice_elem_unbounded_ok(tcx: TyCtxt, ty: Ty) -> bool {
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Int(_))
+        | TyKind::RigidTy(RigidTy::Uint(_))
+        | TyKind::RigidTy(RigidTy::Float(_)) => true,
+        TyKind::RigidTy(RigidTy::Bool) => true,
+        TyKind::RigidTy(RigidTy::Char) => false,
+        TyKind::RigidTy(RigidTy::Adt(..)) => match scalar_niche(tcx, ty) {
+            // No niche on a scalar ADT means every bit pattern is valid only if the ADT is
+            // scalar ABI at all; be conservative and require a niche we can express.
+            None => false,
+            // Only byte-width niches: CBMC's quantifier handling does not bind wider
+            // dereferences at symbolic indices (byte_extract limitation), so multi-byte
+            // niched elements (NonZeroU16.., deranged RangedU32..) use the bounded path.
+            Some(niche) => niche.bits == 8,
+        },
+        _ => false,
+    }
+}
+
 /// The niche constraint of a scalar-ABI type: the unsigned integer type that holds the
 /// scalar's bits, and the (possibly wrapping) inclusive range of valid bit patterns.
 /// Returns None for non-scalar ABIs, pointer/float scalars, and scalars whose valid range
@@ -954,6 +985,7 @@ fn autoharness_supported_arg_ty(
     ty: Ty,
     kani_any_def: FnDef,
     kani_bounded_any_def: FnDef,
+    unbounded_slice_available: bool,
     smart_pointer_models: &SmartPointerModels,
     ty_arbitrary_cache: &mut FxHashMap<Ty, bool>,
 ) -> ArgSupport {
@@ -976,6 +1008,7 @@ fn autoharness_supported_arg_ty(
             inner_ty,
             kani_any_def,
             kani_bounded_any_def,
+            unbounded_slice_available,
             smart_pointer_models,
             ty_arbitrary_cache,
         );
@@ -983,7 +1016,20 @@ fn autoharness_supported_arg_ty(
     if let TyKind::RigidTy(RigidTy::Ref(_, inner_ty, inner_mutability)) = ty.kind() {
         match inner_ty.kind() {
             TyKind::RigidTy(RigidTy::Slice(elem_ty)) => {
-                if arbitrary_or_derive(elem_ty, ty_arbitrary_cache) == ArgSupport::Arbitrary {
+                // Immutable slices of qualifying element types (integers/floats and
+                // byte-width niched scalars, c.f. `slice_elem_unbounded_ok`) are generated
+                // *unbounded* (`KaniModel::AnySliceRefUnbounded`, a fresh allocation of
+                // nondeterministic size): verification results hold for all lengths, so
+                // this is ordinary (non-bounded) support. The model requires `alloc`, so
+                // it is optional; without it (e.g. verify-std no-core mode), and for
+                // mutable slices or other element types, fall back to bounded storage.
+                if inner_mutability == Mutability::Not
+                    && slice_elem_unbounded_ok(tcx, elem_ty)
+                    && unbounded_slice_available
+                {
+                    ArgSupport::Arbitrary
+                } else if arbitrary_or_derive(elem_ty, ty_arbitrary_cache) == ArgSupport::Arbitrary
+                {
                     ArgSupport::Bounded
                 } else {
                     ArgSupport::Unsupported
