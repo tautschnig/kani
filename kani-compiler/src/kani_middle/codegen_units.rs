@@ -9,7 +9,7 @@
 
 use crate::args::{Arguments, ReachabilityType};
 use crate::kani_middle::attributes::{KaniAttributes, is_proof_harness};
-use crate::kani_middle::kani_functions::{KaniIntrinsic, KaniModel};
+use crate::kani_middle::kani_functions::{KaniHook, KaniIntrinsic, KaniModel};
 use crate::kani_middle::metadata::{
     gen_automatic_proof_metadata, gen_contracts_metadata, gen_proof_metadata,
 };
@@ -111,6 +111,7 @@ impl CodegenUnits {
                     &crate_info.name,
                     *kani_fns.get(&KaniModel::Any.into()).unwrap(),
                     *kani_fns.get(&KaniModel::BoundedAny.into()).unwrap(),
+                    *kani_fns.get(&KaniHook::Assert.into()).unwrap(),
                     kani_fns.contains_key(&KaniModel::AnySliceRefUnbounded.into()),
                     SmartPointerModels::from_kani_functions(kani_fns),
                 );
@@ -657,6 +658,7 @@ fn automatic_harness_partition(
     crate_name: &str,
     kani_any_def: FnDef,
     kani_bounded_any_def: FnDef,
+    kani_assert_def: FnDef,
     unbounded_slice_available: bool,
     smart_pointer_models: SmartPointerModels,
 ) -> (Vec<(Instance, bool, bool)>, BTreeMap<String, AutoHarnessSkipReason>) {
@@ -834,6 +836,7 @@ fn automatic_harness_partition(
                                 tcx,
                                 arg.ty,
                                 kani_any_def,
+                                kani_assert_def,
                                 &mut FxHashMap::default(),
                                 &mut vec![],
                             )

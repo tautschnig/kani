@@ -87,6 +87,7 @@ pub mod coercion;
 mod intrinsics;
 pub mod kani_functions;
 pub mod metadata;
+pub mod mined_invariants;
 pub mod points_to;
 pub mod provide;
 pub mod reachability;
@@ -481,6 +482,7 @@ pub fn uses_ctor_generation(
     tcx: TyCtxt,
     ty: Ty,
     kani_any_def: FnDef,
+    kani_assert_def: FnDef,
     ty_arbitrary_cache: &mut FxHashMap<Ty, bool>,
     visited: &mut Vec<Ty>,
 ) -> bool {
@@ -490,13 +492,34 @@ pub fn uses_ctor_generation(
     visited.push(ty);
     match ty.kind() {
         TyKind::RigidTy(RigidTy::Ref(_, inner, _)) | TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => {
-            uses_ctor_generation(tcx, inner, kani_any_def, ty_arbitrary_cache, visited)
+            uses_ctor_generation(
+                tcx,
+                inner,
+                kani_any_def,
+                kani_assert_def,
+                ty_arbitrary_cache,
+                visited,
+            )
         }
         TyKind::RigidTy(RigidTy::Array(inner, _)) | TyKind::RigidTy(RigidTy::Slice(inner)) => {
-            uses_ctor_generation(tcx, inner, kani_any_def, ty_arbitrary_cache, visited)
+            uses_ctor_generation(
+                tcx,
+                inner,
+                kani_any_def,
+                kani_assert_def,
+                ty_arbitrary_cache,
+                visited,
+            )
         }
         TyKind::RigidTy(RigidTy::Tuple(elems)) => elems.iter().any(|elem| {
-            uses_ctor_generation(tcx, *elem, kani_any_def, ty_arbitrary_cache, visited)
+            uses_ctor_generation(
+                tcx,
+                *elem,
+                kani_any_def,
+                kani_assert_def,
+                ty_arbitrary_cache,
+                visited,
+            )
         }),
         TyKind::RigidTy(RigidTy::Adt(def, args)) => {
             // Hand-written Arbitrary implementations take precedence over ctor generation
@@ -512,20 +535,34 @@ pub fn uses_ctor_generation(
             {
                 return true;
             }
+            // Mined-invariant assumptions are heuristic filters like constructor-based
+            // generation, so harnesses using them carry the same marker.
+            if def.kind() == AdtKind::Struct
+                && !mined_invariants::mine_self_assert_conjuncts(tcx, ty, kani_assert_def)
+                    .is_empty()
+            {
+                return true;
+            }
             def.variants_iter().any(|variant| {
                 variant.fields().iter().any(|field| {
                     uses_ctor_generation(
                         tcx,
                         field.ty_with_args(&args),
                         kani_any_def,
+                        kani_assert_def,
                         ty_arbitrary_cache,
                         visited,
                     )
                 })
             }) || args.0.iter().any(|arg| match arg {
-                GenericArgKind::Type(t) => {
-                    uses_ctor_generation(tcx, *t, kani_any_def, ty_arbitrary_cache, visited)
-                }
+                GenericArgKind::Type(t) => uses_ctor_generation(
+                    tcx,
+                    *t,
+                    kani_any_def,
+                    kani_assert_def,
+                    ty_arbitrary_cache,
+                    visited,
+                ),
                 _ => false,
             })
         }
