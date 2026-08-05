@@ -392,34 +392,27 @@ fn implements_invariant(
 }
 
 /// Whether `&[T]` arguments with this element type qualify for *unbounded* generation
-/// (`KaniModel::AnySliceRefUnbounded`): raw nondeterministic memory must be a sound and
-/// complete model of the element's values, given the validity assumption the
-/// `SliceValidityAssume` hook can express (byte-granularity predicates only):
-/// - types without a layout niche whose every bit pattern is valid (integers, floats);
-/// - 8-bit niched scalars (bool, u8-based ranged types);
-/// - NonZero-style niches (zero excluded, full top) of any width, via bytewise "some byte
-///   nonzero".
-/// `char` is explicitly excluded: its layout niche (0..=0x10FFFF) does not capture the
-/// surrogate hole, so a niche assumption would still generate invalid values. Wider general
-/// ranges (e.g. deranged's RangedU32) are not byte-decomposable and use the bounded path.
-pub fn slice_elem_unbounded_ok(tcx: TyCtxt, ty: Ty) -> bool {
-    match ty.kind() {
+/// (`KaniModel::AnySliceRefUnbounded`): raw nondeterministic memory must be a sound AND
+/// complete model of the element's values *without any validity assumption*, i.e. every bit
+/// pattern must be a valid element. This holds exactly for the primitive integer and float
+/// types.
+///
+/// Types with validity constraints (bool, char, NonZero, ranged newtypes) are excluded even
+/// though the `SliceValidityAssume` hook can express byte-width niche constraints: CBMC's
+/// default (SAT) backend only instantiates quantifiers with *constant* bounds, and silently
+/// degrades symbolic-bound quantifiers to unconstrained free variables
+/// (`boolbvt::finish_eager_conversion_quantifiers` -> `conversion_failed`), which would make
+/// the validity assumption vacuous. SMT backends (e.g. `--solver z3`) handle the quantified
+/// assumption, including multi-byte elements; routing niched element types here can be
+/// revisited when CBMC's SAT backend learns symbolic-bound instantiation or Kani selects
+/// backends per harness.
+pub fn slice_elem_unbounded_ok(_tcx: TyCtxt, ty: Ty) -> bool {
+    matches!(
+        ty.kind(),
         TyKind::RigidTy(RigidTy::Int(_))
-        | TyKind::RigidTy(RigidTy::Uint(_))
-        | TyKind::RigidTy(RigidTy::Float(_)) => true,
-        TyKind::RigidTy(RigidTy::Bool) => true,
-        TyKind::RigidTy(RigidTy::Char) => false,
-        TyKind::RigidTy(RigidTy::Adt(..)) => match scalar_niche(tcx, ty) {
-            // No niche on a scalar ADT means every bit pattern is valid only if the ADT is
-            // scalar ABI at all; be conservative and require a niche we can express.
-            None => false,
-            // Only byte-width niches: CBMC's quantifier handling does not bind wider
-            // dereferences at symbolic indices (byte_extract limitation), so multi-byte
-            // niched elements (NonZeroU16.., deranged RangedU32..) use the bounded path.
-            Some(niche) => niche.bits == 8,
-        },
-        _ => false,
-    }
+            | TyKind::RigidTy(RigidTy::Uint(_))
+            | TyKind::RigidTy(RigidTy::Float(_))
+    )
 }
 
 /// The niche constraint of a scalar-ABI type: the unsigned integer type that holds the
