@@ -117,7 +117,7 @@ impl CodegenUnits {
                     .set(AutoHarnessMetadata {
                         chosen: chosen
                             .iter()
-                            .map(|(func, _)| {
+                            .map(|(func, ..)| {
                                 crate::kani_middle::strip_local_crate_prefix(func.name())
                             })
                             .collect::<BTreeSet<_>>(),
@@ -372,13 +372,13 @@ fn determine_targets(
 /// the AutomaticHarnessPass will later transform the bodies of these instances to actually verify the function.
 fn get_all_automatic_harnesses(
     tcx: TyCtxt,
-    verifiable_fns: Vec<(Instance, bool)>,
+    verifiable_fns: Vec<(Instance, bool, bool)>,
     kani_harness_intrinsic: FnDef,
     base_filename: &Path,
 ) -> HashMap<Harness, HarnessMetadata> {
     verifiable_fns
         .into_iter()
-        .map(|(fn_to_verify, is_bounded)| {
+        .map(|(fn_to_verify, is_bounded, is_ctor_based)| {
             // Set the generic arguments of the harness to be the function it is verifying
             // so that later, in AutomaticHarnessPass, we can retrieve the function to verify
             // and generate the harness body accordingly.
@@ -393,6 +393,7 @@ fn get_all_automatic_harnesses(
                 &fn_to_verify,
                 harness.mangled_name(),
                 is_bounded,
+                is_ctor_based,
             );
             (harness, metadata)
         })
@@ -656,7 +657,7 @@ fn automatic_harness_partition(
     kani_any_def: FnDef,
     kani_bounded_any_def: FnDef,
     smart_pointer_models: SmartPointerModels,
-) -> (Vec<(Instance, bool)>, BTreeMap<String, AutoHarnessSkipReason>) {
+) -> (Vec<(Instance, bool, bool)>, BTreeMap<String, AutoHarnessSkipReason>) {
     let crate_fn_defs = rustc_public::local_crate().fn_defs().into_iter().collect::<FxHashSet<_>>();
     // Filter out CrateItems that are functions, but not functions defined in the crate itself, i.e., rustc-inserted functions
     // (c.f. https://github.com/model-checking/kani/issues/4189)
@@ -821,7 +822,21 @@ fn automatic_harness_partition(
                 skipped
                     .insert(crate::kani_middle::strip_local_crate_prefix(instance.name()), reason);
             }
-            Ok(is_bounded) => chosen.push((instance, is_bounded)),
+            Ok(is_bounded) => {
+                let is_ctor_based = args.autoharness_constructor_args
+                    && instance.body().is_some_and(|body| {
+                        body.arg_locals().iter().any(|arg| {
+                            crate::kani_middle::uses_ctor_generation(
+                                tcx,
+                                arg.ty,
+                                kani_any_def,
+                                &mut FxHashMap::default(),
+                                &mut vec![],
+                            )
+                        })
+                    });
+                chosen.push((instance, is_bounded, is_ctor_based));
+            }
         }
     }
 
