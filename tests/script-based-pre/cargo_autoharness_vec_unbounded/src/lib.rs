@@ -24,3 +24,12 @@ pub fn coverage(v: Vec<i32>) {
 pub fn total(v: Vec<u8>) -> u64 {
     v.iter().map(|&b| b as u64).sum()
 }
+
+// TEST NOTE: should PASS for ALL lengths: mutable slices are also unbounded (fresh
+// exclusive allocations), and writes through them verify.
+pub fn set_first(s: &mut [u8]) {
+    if !s.is_empty() {
+        s[0] = 42;
+        assert_eq!(s[0], 42);
+    }
+}

@@ -64,6 +64,31 @@ pub fn any_slice_ref_unbounded<T>() -> &'static [T] {
     unsafe { std::slice::from_raw_parts(ptr as *const T, len) }
 }
 
+/// Generate a mutable slice of *unbounded* nondeterministic length: as
+/// `any_slice_ref_unbounded`, but returning `&mut [T]`. Each call produces a fresh (leaked)
+/// allocation, so the returned slice is exclusive by construction; writes through it are
+/// unconstrained by other generated values.
+///
+/// This model is *optional*: it requires `alloc`, c.f. `KaniModel::is_optional`.
+#[kanitool::fn_marker = "AnySliceMutUnboundedModel"]
+#[inline(never)]
+#[doc(hidden)]
+pub fn any_slice_mut_unbounded<T>() -> &'static mut [T] {
+    let len: usize = crate::any();
+    let elem = std::mem::size_of::<T>();
+    if elem == 0 {
+        return unsafe {
+            std::slice::from_raw_parts_mut(std::ptr::NonNull::dangling().as_ptr(), len)
+        };
+    }
+    crate::assume(len <= (isize::MAX as usize) / elem);
+    let layout = std::alloc::Layout::array::<T>(len.max(1)).unwrap();
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    crate::assume(!ptr.is_null());
+    slice_validity_assume::<T>(ptr, len);
+    unsafe { std::slice::from_raw_parts_mut(ptr as *mut T, len) }
+}
+
 /// Generate a `Vec` of *unbounded* nondeterministic length: a fresh allocation of
 /// nondeterministic size whose contents are nondeterministic, with element validity
 /// established by `slice_validity_assume` (c.f. `any_slice_ref_unbounded`), handed to

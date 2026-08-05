@@ -1039,10 +1039,9 @@ fn autoharness_supported_arg_ty(
                 // this is ordinary (non-bounded) support. The model requires `alloc`, so
                 // it is optional; without it (e.g. verify-std no-core mode), and for
                 // mutable slices or other element types, fall back to bounded storage.
-                if inner_mutability == Mutability::Not
-                    && slice_elem_unbounded_ok(tcx, elem_ty)
-                    && unbounded_slice_available
-                {
+                if slice_elem_unbounded_ok(tcx, elem_ty) && unbounded_slice_available {
+                    // Mutable slices use a dedicated model returning &mut [T]; both are
+                    // fresh (leaked) allocations, exclusive by construction.
                     ArgSupport::Arbitrary
                 } else if arbitrary_or_derive(elem_ty, ty_arbitrary_cache) == ArgSupport::Arbitrary
                 {
