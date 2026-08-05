@@ -75,6 +75,8 @@ pub enum KaniModel {
     AnySliceRef,
     #[strum(serialize = "AnySliceRefUnboundedModel")]
     AnySliceRefUnbounded,
+    #[strum(serialize = "AnyVecUnboundedModel")]
+    AnyVecUnbounded,
     #[strum(serialize = "AnyStrRefModel")]
     AnyStrRef,
     #[strum(serialize = "BoundedAnyModel")]
@@ -197,6 +199,7 @@ impl KaniModel {
                 | KaniModel::AnyBox
                 | KaniModel::AnyRc
                 | KaniModel::AnySliceRefUnbounded
+                | KaniModel::AnyVecUnbounded
         )
     }
 }

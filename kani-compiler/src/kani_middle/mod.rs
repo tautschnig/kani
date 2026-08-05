@@ -391,6 +391,29 @@ fn implements_invariant(
     res
 }
 
+/// If `ty` is `Vec<T>` with the default allocator, return `T`.
+pub fn vec_elem_ty(ty: Ty) -> Option<Ty> {
+    let TyKind::RigidTy(RigidTy::Adt(def, ref args)) = ty.kind() else { return None };
+    let name = def.name();
+    if name != "std::vec::Vec" && name != "alloc::vec::Vec" {
+        return None;
+    }
+    // Vec<T, A = Global>: only the default allocator is supported (the model allocates via
+    // the global allocator). The allocator parameter is defaulted, so a crate naming a
+    // custom allocator produces a second type argument != Global.
+    let mut ty_args = args.0.iter().filter_map(|a| match a {
+        GenericArgKind::Type(t) => Some(*t),
+        _ => None,
+    });
+    let elem = ty_args.next()?;
+    if let Some(alloc_ty) = ty_args.next()
+        && !alloc_ty.to_string().contains("Global")
+    {
+        return None;
+    }
+    Some(elem)
+}
+
 /// Whether `&[T]` arguments with this element type qualify for *unbounded* generation
 /// (`KaniModel::AnySliceRefUnbounded`): raw nondeterministic memory must be a sound AND
 /// complete model of the element's values *without any validity assumption*, i.e. every bit
@@ -1048,6 +1071,13 @@ fn autoharness_supported_arg_ty(
         {
             // Smart pointers of (implementable or derivable) pointees cover exactly the values
             // of the pointee, so they are ordinary (non-bounded) support.
+            ArgSupport::Arbitrary
+        } else if let Some(elem) = vec_elem_ty(ty)
+            && slice_elem_unbounded_ok(tcx, elem)
+            && unbounded_slice_available
+        {
+            // Vec<T> of qualifying element types is generated unbounded
+            // (KaniModel::AnyVecUnbounded), like slices: ordinary (non-bounded) support.
             ArgSupport::Arbitrary
         } else if implements_bounded_arbitrary(tcx, ty, kani_bounded_any_def) {
             ArgSupport::Bounded

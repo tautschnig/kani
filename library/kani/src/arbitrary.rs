@@ -64,6 +64,38 @@ pub fn any_slice_ref_unbounded<T>() -> &'static [T] {
     unsafe { std::slice::from_raw_parts(ptr as *const T, len) }
 }
 
+/// Generate a `Vec` of *unbounded* nondeterministic length: a fresh allocation of
+/// nondeterministic size whose contents are nondeterministic, with element validity
+/// established by `slice_validity_assume` (c.f. `any_slice_ref_unbounded`), handed to
+/// `Vec::from_raw_parts` with `capacity == len` (the allocation came from the global
+/// allocator with exactly that layout, as `Vec`'s safety contract requires; `Vec` frees it
+/// on drop).
+///
+/// This model is used by the compiler to generate nondeterministic `Vec<T>` arguments for
+/// automatic harnesses (`kani autoharness`) when the element type qualifies; verification
+/// results hold for ALL lengths. Optional: requires `alloc`.
+#[kanitool::fn_marker = "AnyVecUnboundedModel"]
+#[inline(never)]
+#[doc(hidden)]
+pub fn any_vec_unbounded<T>() -> Vec<T> {
+    let len: usize = crate::any();
+    let elem = std::mem::size_of::<T>();
+    if elem == 0 {
+        // For ZSTs, Vec never allocates and uses a dangling pointer; constructing from a
+        // dangling pointer with any len is the documented pattern (and loop-free, which
+        // matters: generation code must not itself be bounded by unwinding).
+        return unsafe {
+            Vec::from_raw_parts(std::ptr::NonNull::dangling().as_ptr(), len, usize::MAX)
+        };
+    }
+    crate::assume(len <= (isize::MAX as usize) / elem);
+    let layout = std::alloc::Layout::array::<T>(len.max(1)).unwrap();
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    crate::assume(!ptr.is_null());
+    slice_validity_assume::<T>(ptr, len);
+    unsafe { Vec::from_raw_parts(ptr as *mut T, len, len.max(1)) }
+}
+
 /// Compiler hook (c.f. `KaniHook::SliceValidityAssume`): assume that every element of the
 /// `len`-element `T`-array at `ptr` has raw bits within `T`'s layout niche. Lowered directly
 /// to a quantified goto assumption; a no-op when `T` has no niche. The default body is

@@ -47,6 +47,8 @@ pub struct AutomaticArbitraryPass {
     kani_any_slice_ref: FnDef,
     /// The (optional) FnDef of KaniModel::AnySliceRefUnbounded (requires alloc).
     kani_any_slice_ref_unbounded: Option<FnDef>,
+    /// The (optional) FnDef of KaniModel::AnyVecUnbounded (requires alloc).
+    kani_any_vec_unbounded: Option<FnDef>,
     /// The FnDef of KaniModel::AnyStrRef
     kani_any_str_ref: FnDef,
     /// The FnDef of KaniModel::BoundedAny
@@ -73,6 +75,7 @@ impl AutomaticArbitraryPass {
         let kani_any_slice_ref = *kani_fns.get(&KaniModel::AnySliceRef.into()).unwrap();
         let kani_any_slice_ref_unbounded =
             kani_fns.get(&KaniModel::AnySliceRefUnbounded.into()).copied();
+        let kani_any_vec_unbounded = kani_fns.get(&KaniModel::AnyVecUnbounded.into()).copied();
         let kani_any_str_ref = *kani_fns.get(&KaniModel::AnyStrRef.into()).unwrap();
         let kani_bounded_any = *kani_fns.get(&KaniModel::BoundedAny.into()).unwrap();
         let kani_assume_safe = *kani_fns.get(&KaniModel::AssumeSafe.into()).unwrap();
@@ -85,6 +88,7 @@ impl AutomaticArbitraryPass {
             kani_any_ptr,
             kani_any_slice_ref,
             kani_any_slice_ref_unbounded,
+            kani_any_vec_unbounded,
             kani_any_str_ref,
             kani_bounded_any,
             kani_assume_safe,
@@ -712,6 +716,7 @@ fn call_kani_any_for_ty(
     kani_any_ptr: FnDef,
     kani_any_slice_ref: FnDef,
     kani_any_slice_ref_unbounded: Option<FnDef>,
+    kani_any_vec_unbounded: Option<FnDef>,
     kani_any_str_ref: FnDef,
     kani_bounded_any: FnDef,
     kani_assume_safe: FnDef,
@@ -791,6 +796,7 @@ fn call_kani_any_for_ty(
                     kani_any_ptr,
                     kani_any_slice_ref,
                     kani_any_slice_ref_unbounded,
+                    kani_any_vec_unbounded,
                     kani_any_str_ref,
                     kani_bounded_any,
                     kani_assume_safe,
@@ -868,6 +874,7 @@ fn call_kani_any_for_ty(
             kani_any_ptr,
             kani_any_slice_ref,
             kani_any_slice_ref_unbounded,
+            kani_any_vec_unbounded,
             kani_any_str_ref,
             kani_bounded_any,
             kani_assume_safe,
@@ -902,6 +909,7 @@ fn call_kani_any_for_ty(
             kani_any_ptr,
             kani_any_slice_ref,
             kani_any_slice_ref_unbounded,
+            kani_any_vec_unbounded,
             kani_any_str_ref,
             kani_bounded_any,
             kani_assume_safe,
@@ -963,6 +971,16 @@ fn call_kani_any_for_ty(
         let inst = if use_arbitrary {
             Instance::resolve(kani_any, &GenericArgs(vec![GenericArgKind::Type(ty)]))
                 .unwrap_or_else(|_| panic!("expected a ty that implements Arbitrary, got {ty}"))
+        } else if let Some(model_inst) = kani_any_vec_unbounded.and_then(|model| {
+            let elem = crate::kani_middle::vec_elem_ty(ty)?;
+            if !crate::kani_middle::slice_elem_unbounded_ok(tcx, elem) {
+                return None;
+            }
+            Instance::resolve(model, &GenericArgs(vec![GenericArgKind::Type(elem)])).ok()
+        }) {
+            // Vec<T> of qualifying element types: unbounded generation, c.f. the
+            // AnyVecUnbounded model (mirrors the eligibility decision).
+            model_inst
         } else if let Some((model_inst, _)) =
             smart_pointer_model_instance(tcx, ty, smart_pointer_models)
         {
@@ -1051,6 +1069,7 @@ impl AutomaticArbitraryPass {
                 self.kani_any_ptr,
                 self.kani_any_slice_ref,
                 self.kani_any_slice_ref_unbounded,
+                self.kani_any_vec_unbounded,
                 self.kani_any_str_ref,
                 self.kani_bounded_any,
                 self.kani_assume_safe,
@@ -1109,6 +1128,7 @@ impl AutomaticArbitraryPass {
             self.kani_any_ptr,
             self.kani_any_slice_ref,
             self.kani_any_slice_ref_unbounded,
+            self.kani_any_vec_unbounded,
             self.kani_any_str_ref,
             self.kani_bounded_any,
             self.kani_assume_safe,
@@ -1222,6 +1242,7 @@ impl AutomaticArbitraryPass {
                     self.kani_any_ptr,
                     self.kani_any_slice_ref,
                     self.kani_any_slice_ref_unbounded,
+                    self.kani_any_vec_unbounded,
                     self.kani_any_str_ref,
                     self.kani_bounded_any,
                     self.kani_assume_safe,
@@ -1299,6 +1320,7 @@ impl AutomaticArbitraryPass {
                     self.kani_any_ptr,
                     self.kani_any_slice_ref,
                     self.kani_any_slice_ref_unbounded,
+                    self.kani_any_vec_unbounded,
                     self.kani_any_str_ref,
                     self.kani_bounded_any,
                     self.kani_assume_safe,
@@ -1443,6 +1465,7 @@ pub struct AutomaticHarnessPass {
     kani_any_ptr: FnDef,
     kani_any_slice_ref: FnDef,
     kani_any_slice_ref_unbounded: Option<FnDef>,
+    kani_any_vec_unbounded: Option<FnDef>,
     kani_any_str_ref: FnDef,
     kani_bounded_any: FnDef,
     kani_assume_safe: FnDef,
@@ -1464,6 +1487,7 @@ impl AutomaticHarnessPass {
         let kani_any_slice_ref = *kani_fns.get(&KaniModel::AnySliceRef.into()).unwrap();
         let kani_any_slice_ref_unbounded =
             kani_fns.get(&KaniModel::AnySliceRefUnbounded.into()).copied();
+        let kani_any_vec_unbounded = kani_fns.get(&KaniModel::AnyVecUnbounded.into()).copied();
         let kani_any_str_ref = *kani_fns.get(&KaniModel::AnyStrRef.into()).unwrap();
         let kani_bounded_any = *kani_fns.get(&KaniModel::BoundedAny.into()).unwrap();
         let kani_assume_safe = *kani_fns.get(&KaniModel::AssumeSafe.into()).unwrap();
@@ -1479,6 +1503,7 @@ impl AutomaticHarnessPass {
             kani_any_ptr,
             kani_any_slice_ref,
             kani_any_slice_ref_unbounded,
+            kani_any_vec_unbounded,
             kani_any_str_ref,
             kani_bounded_any,
             kani_assume_safe,
@@ -1538,6 +1563,7 @@ impl TransformPass for AutomaticHarnessPass {
                 self.kani_any_ptr,
                 self.kani_any_slice_ref,
                 self.kani_any_slice_ref_unbounded,
+                self.kani_any_vec_unbounded,
                 self.kani_any_str_ref,
                 self.kani_bounded_any,
                 self.kani_assume_safe,
@@ -1611,6 +1637,7 @@ impl TransformPass for AutomaticHarnessPass {
                     self.kani_any_ptr,
                     self.kani_any_slice_ref,
                     self.kani_any_slice_ref_unbounded,
+                    self.kani_any_vec_unbounded,
                     self.kani_any_str_ref,
                     self.kani_bounded_any,
                     self.kani_assume_safe,

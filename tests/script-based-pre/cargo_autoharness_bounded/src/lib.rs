@@ -8,7 +8,9 @@
 // only hold up to that bound. The "TEST NOTE" comments explain the expected result per
 // function.
 
-// TEST NOTE: should PASS: summing at most 4 u8s cannot overflow u64.
+// TEST NOTE: should FAIL with an unwinding assertion: Vec<u8> is now generated UNBOUNDED
+// (all lengths), so the default loop bound cannot cover it — the incompleteness is signaled
+// rather than silently bounded.
 pub fn vec_sum(xs: Vec<u8>) -> u64 {
     xs.iter().map(|&x| x as u64).sum()
 }
