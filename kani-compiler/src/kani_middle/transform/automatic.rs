@@ -13,10 +13,9 @@ use crate::kani_middle::kani_functions::{KaniHook, KaniIntrinsic, KaniModel};
 use crate::kani_middle::transform::body::{InsertPosition, MutableBody, SourceInstruction};
 use crate::kani_middle::transform::{TransformPass, TransformationType};
 use crate::kani_middle::{
-    FmtTrait, SmartPointerModels, can_derive_arbitrary, fmt_impl_self_ty, implements_arbitrary,
-    implements_invariant, scalar_niche, smart_pointer_model_instance,
     CtorReturn, FmtTrait, SmartPointerModels, can_derive_arbitrary, find_arbitrary_constructor,
-    fmt_impl_self_ty, implements_arbitrary, implements_invariant, smart_pointer_model_instance,
+    fmt_impl_self_ty, implements_arbitrary, implements_invariant, scalar_niche,
+    smart_pointer_model_instance,
 };
 use crate::kani_queries::QueryDb;
 use rustc_data_structures::fx::FxHashMap;
@@ -24,13 +23,11 @@ use rustc_middle::ty::TyCtxt;
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
-    AggregateKind, BasicBlockIdx, BinOp, Body, BorrowKind, CastKind, ConstOperand, Local,
-    MutBorrowKind, Mutability, Operand, Place, ProjectionElem, Rvalue, SwitchTargets, Terminator,
-    TerminatorKind,
-    AggregateKind, BasicBlockIdx, Body, BorrowKind, CastKind, ConstOperand, Local, MutBorrowKind,
-    Mutability, Operand, Place, ProjectionElem, Rvalue, SwitchTargets, Terminator, TerminatorKind,
+    AggregateKind, BasicBlock, BasicBlockIdx, BinOp, Body, BorrowKind, CastKind, ConstOperand,
+    Local, LocalDecl, MutBorrowKind, Mutability, NonDivergingIntrinsic, Operand, Place,
+    ProjectionElem, Rvalue, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind,
+    UnOp, UnwindAction,
 };
-use rustc_public::ty::MirConst;
 use rustc_public::ty::{
     AdtDef, AdtKind, FnDef, GenericArgKind, GenericArgs, MirConst, Region, RegionKind, RigidTy, Ty,
     TyConst, TyKind, UintTy, VariantDef,
@@ -58,8 +55,9 @@ pub struct AutomaticArbitraryPass {
     smart_pointer_models: SmartPointerModels,
     /// The FnDef of KaniHook::Assume (used for layout-niche assumptions).
     kani_assume: FnDef,
-    /// The FnDef of KaniHook::Assume (used to assume constructor success).
-    kani_assume: FnDef,
+    /// The FnDef of KaniHook::Assert (rewritten into assumptions when inlining
+    /// assert-guarded constructors).
+    kani_assert: FnDef,
     /// Whether --constructor-args is enabled: generate values of private-field types through
     /// their public constructors instead of raw field synthesis.
     constructor_args: bool,
@@ -76,6 +74,7 @@ impl AutomaticArbitraryPass {
         let kani_assume_safe = *kani_fns.get(&KaniModel::AssumeSafe.into()).unwrap();
         let smart_pointer_models = SmartPointerModels::from_kani_functions(kani_fns);
         let kani_assume = *kani_fns.get(&KaniHook::Assume.into()).unwrap();
+        let kani_assert = *kani_fns.get(&KaniHook::Assert.into()).unwrap();
         let constructor_args = query_db.args().autoharness_constructor_args;
         Self {
             kani_any,
@@ -86,6 +85,7 @@ impl AutomaticArbitraryPass {
             kani_assume_safe,
             smart_pointer_models,
             kani_assume,
+            kani_assert,
             constructor_args,
         }
     }
@@ -169,11 +169,28 @@ impl TransformPass for AutomaticArbitraryPass {
             if self.constructor_args
                 && def.kind() == AdtKind::Struct
                 && crate::kani_middle::adt_has_private_field_check(tcx, def)
-                && let Some((ctor, shape)) =
-                    find_arbitrary_constructor(tcx, *ty, self.kani_any, &mut FxHashMap::default())
             {
-                debug!(?ty, ctor=?ctor.name(), ?shape, "generate_ctor_body");
-                return (true, self.generate_ctor_body(tcx, ctor, shape, *ty, body));
+                // Prefer assert-guarded representation constructors, inlined with panic
+                // paths converted to assumptions: their own assertions state the type's
+                // validity contract, and they are typically surjective onto the valid value
+                // space (unlike checked constructors, which may reach only a subset).
+                if let Some(ctor) = crate::kani_middle::find_unchecked_constructor(
+                    tcx,
+                    *ty,
+                    self.kani_any,
+                    &mut FxHashMap::default(),
+                ) && let Some(new_body) =
+                    self.generate_unchecked_ctor_body(tcx, ctor, *ty, body.clone())
+                {
+                    debug!(?ty, ctor=?ctor.name(), "generate_unchecked_ctor_body");
+                    return (true, new_body);
+                }
+                if let Some((ctor, shape)) =
+                    find_arbitrary_constructor(tcx, *ty, self.kani_any, &mut FxHashMap::default())
+                {
+                    debug!(?ty, ctor=?ctor.name(), ?shape, "generate_ctor_body");
+                    return (true, self.generate_ctor_body(tcx, ctor, shape, *ty, body));
+                }
             }
             match def.kind() {
                 AdtKind::Enum => (true, self.generate_enum_body(tcx, def, args, body)),
@@ -214,6 +231,282 @@ const AUTOHARNESS_BOUNDED_ANY_BOUND: u64 = 4;
 /// which stays alive for the entire harness.
 /// Panics if `ty` does not implement Arbitrary (and is not a reference to a slice or str of
 /// such a type).
+/// Remap all locals and block targets of an inlined basic block. Returns false (bail out)
+/// when the block contains a construct the remapper does not support; the caller then falls
+/// back to non-inlined generation. The whitelist covers everything rustc emits for
+/// assert-guarded field-packing constructors (the C14 mining target).
+fn remap_block(bb: &mut BasicBlock, local_map: &[Local], block_offset: usize) -> bool {
+    let remap_place = |p: &mut Place| {
+        p.local = local_map[p.local];
+        for elem in p.projection.iter_mut() {
+            if let ProjectionElem::Index(l) = elem {
+                *l = local_map[*l];
+            }
+        }
+    };
+    let remap_operand = |op: &mut Operand| match op {
+        Operand::Copy(p) | Operand::Move(p) => remap_place(p),
+        Operand::Constant(_) | Operand::RuntimeChecks(_) => {}
+    };
+    for stmt in bb.statements.iter_mut() {
+        match &mut stmt.kind {
+            StatementKind::Assign(place, rvalue) => {
+                remap_place(place);
+                match rvalue {
+                    Rvalue::Use(op) | Rvalue::Repeat(op, _) | Rvalue::Cast(_, op, _) => {
+                        remap_operand(op)
+                    }
+                    Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+                        remap_operand(a);
+                        remap_operand(b);
+                    }
+                    Rvalue::UnaryOp(_, op) => remap_operand(op),
+                    Rvalue::Ref(_, _, p)
+                    | Rvalue::AddressOf(_, p)
+                    | Rvalue::CopyForDeref(p)
+                    | Rvalue::Discriminant(p)
+                    | Rvalue::Len(p) => remap_place(p),
+                    Rvalue::Aggregate(_, ops) => ops.iter_mut().for_each(remap_operand),
+                    Rvalue::ShallowInitBox(op, _) => remap_operand(op),
+                    Rvalue::ThreadLocalRef(_) => return false,
+                }
+            }
+            StatementKind::StorageLive(l) | StatementKind::StorageDead(l) => {
+                *l = local_map[*l];
+            }
+            StatementKind::SetDiscriminant { place, .. }
+            | StatementKind::PlaceMention(place)
+            | StatementKind::FakeRead(_, place) => remap_place(place),
+            StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op)) => remap_operand(op),
+            StatementKind::Intrinsic(NonDivergingIntrinsic::CopyNonOverlapping(cp)) => {
+                remap_operand(&mut cp.src);
+                remap_operand(&mut cp.dst);
+                remap_operand(&mut cp.count);
+            }
+            StatementKind::AscribeUserType { .. }
+            | StatementKind::Coverage(_)
+            | StatementKind::ConstEvalCounter
+            | StatementKind::Retag(..)
+            | StatementKind::Nop => {}
+        }
+    }
+    match &mut bb.terminator.kind {
+        TerminatorKind::Goto { target } => *target += block_offset,
+        TerminatorKind::SwitchInt { discr, targets } => {
+            remap_operand(discr);
+            let branches: Vec<_> = targets.branches().map(|(v, t)| (v, t + block_offset)).collect();
+            *targets = SwitchTargets::new(branches, targets.otherwise() + block_offset);
+        }
+        TerminatorKind::Call { func, args, destination, target, .. } => {
+            remap_operand(func);
+            args.iter_mut().for_each(remap_operand);
+            remap_place(destination);
+            if let Some(t) = target {
+                *t += block_offset;
+            }
+        }
+        TerminatorKind::Assert { cond, target, .. } => {
+            remap_operand(cond);
+            *target += block_offset;
+        }
+        TerminatorKind::Drop { place, target, .. } => {
+            remap_place(place);
+            *target += block_offset;
+        }
+        TerminatorKind::Return
+        | TerminatorKind::Unreachable
+        | TerminatorKind::Resume
+        | TerminatorKind::Abort => {}
+        TerminatorKind::InlineAsm { .. } => return false,
+    }
+    true
+}
+
+/// Whether `func` resolves to a panic entry point.
+fn is_panic_call(tcx: TyCtxt, func: &Operand, locals: &[LocalDecl]) -> bool {
+    let Ok(fn_ty) = func.ty(locals) else { return false };
+    let TyKind::RigidTy(RigidTy::FnDef(def, _)) = fn_ty.kind() else { return false };
+    let def_id = rustc_public::rustc_internal::internal(tcx, def.def_id());
+    Some(def_id) == tcx.lang_items().panic_fn()
+        || Some(def_id) == tcx.lang_items().panic_fmt()
+        || Some(def_id) == tcx.lang_items().begin_panic_fn()
+        || def.name().starts_with("core::panicking::")
+}
+
+/// C14 (assert mining, dynamic form): inline `callee`'s monomorphic body into `body` at
+/// `source`, with every panic path converted into `kani::assume(false)`. Calling an
+/// assert-guarded representation constructor (e.g. time's `Date::from_parts`, whose
+/// debug_asserts state the type's validity contract) with nondeterministic arguments then
+/// yields exactly the values that pass the type's own validity assertions: the assertions
+/// act as filters instead of failures. MIR `Assert` terminators (overflow checks etc.) are
+/// likewise converted into assumptions, so argument combinations that make the constructor
+/// itself misbehave do not produce values.
+///
+/// `arg_locals` must hold fully-initialized constructor arguments. Returns the local holding
+/// the constructed value, or None (caller falls back to a plain call) if the callee body
+/// contains unsupported constructs. Only `body.locals` will have been extended in that case
+/// (the unused locals are harmless).
+fn inline_with_assumed_panics(
+    tcx: TyCtxt,
+    kani_assume: FnDef,
+    kani_assert: FnDef,
+    body: &mut MutableBody,
+    source: &mut SourceInstruction,
+    callee: Instance,
+    arg_locals: &[Local],
+    ret_ty: Ty,
+) -> Option<Local> {
+    let callee_body = callee.body()?;
+    let span = source.span(body.blocks());
+
+    // Map callee locals into the caller: _0 -> fresh return local, _1..=argc -> arg_locals,
+    // the rest -> fresh locals.
+    let ret_lcl = body.new_local(ret_ty, span, Mutability::Mut);
+    let mut local_map: Vec<Local> = Vec::with_capacity(callee_body.locals().len());
+    local_map.push(ret_lcl);
+    let argc = callee_body.arg_locals().len();
+    assert_eq!(argc, arg_locals.len());
+    local_map.extend_from_slice(arg_locals);
+    for decl in callee_body.locals().iter().skip(1 + argc) {
+        local_map.push(body.new_local(decl.ty, span, Mutability::Mut));
+    }
+
+    // The caller will be split at `source`; the remainder (continuation) block index and the
+    // appended blocks' indices are all known up front:
+    //   [0..len)           existing blocks (after split: +1 for the remainder)
+    //   len                continuation (remainder of the split block)
+    //   len+1 .. len+1+N   remapped callee blocks (callee block i -> len+1+i)
+    //   len+1+N ..         unreachable blocks for panic rewrites
+    let continuation = body.blocks().len();
+    let block_offset = continuation + 1;
+    let n_callee = callee_body.blocks.len();
+    let assume_inst = Instance::resolve(kani_assume, &GenericArgs(vec![])).unwrap();
+
+    // Pass 1: build all remapped blocks (no body.blocks mutation yet; bail-out is clean).
+    let mut new_blocks: Vec<BasicBlock> = Vec::with_capacity(n_callee);
+    let mut n_unreach = 0usize;
+    for callee_bb in callee_body.blocks.iter() {
+        let mut bb = callee_bb.clone();
+        if !remap_block(&mut bb, &local_map, block_offset) {
+            return None;
+        }
+        match &mut bb.terminator.kind {
+            TerminatorKind::Return => {
+                bb.terminator.kind = TerminatorKind::Goto { target: continuation };
+            }
+            TerminatorKind::Resume | TerminatorKind::Abort => {
+                bb.terminator.kind = TerminatorKind::Unreachable;
+            }
+            TerminatorKind::Assert { cond, expected, target, .. } => {
+                // assume(cond == expected); goto target
+                let (cond, expected, target) = (cond.clone(), *expected, *target);
+                let cond_lcl = body.new_local(Ty::bool_ty(), span, Mutability::Mut);
+                let rv =
+                    if expected { Rvalue::Use(cond) } else { Rvalue::UnaryOp(UnOp::Not, cond) };
+                bb.statements.push(Statement {
+                    kind: StatementKind::Assign(Place::from(cond_lcl), rv),
+                    span,
+                });
+                let func_lcl = body.new_local(assume_inst.ty(), span, Mutability::Not);
+                let unit_lcl = body.new_local(Ty::new_tuple(&[]), span, Mutability::Mut);
+                bb.terminator.kind = TerminatorKind::Call {
+                    func: Operand::Copy(Place::from(func_lcl)),
+                    args: vec![Operand::Move(Place::from(cond_lcl))],
+                    destination: Place::from(unit_lcl),
+                    target: Some(target),
+                    unwind: UnwindAction::Terminate,
+                };
+            }
+            // Kani's macro overrides have already rewritten user panics/asserts into
+            // kani::assert(cond, msg) calls: convert those into kani::assume(cond), which is
+            // precisely the mining conversion (the assert condition becomes a filter).
+            TerminatorKind::Call { func, args, target, .. }
+                if func.ty(body.locals()).is_ok_and(|fn_ty| {
+                    matches!(fn_ty.kind(),
+                        TyKind::RigidTy(RigidTy::FnDef(def, _)) if def == kani_assert)
+                }) =>
+            {
+                let cond = args[0].clone();
+                let target = target.expect("kani::assert has a return target");
+                let func_lcl = body.new_local(assume_inst.ty(), span, Mutability::Not);
+                let unit_lcl = body.new_local(Ty::new_tuple(&[]), span, Mutability::Mut);
+                bb.terminator.kind = TerminatorKind::Call {
+                    func: Operand::Copy(Place::from(func_lcl)),
+                    args: vec![cond],
+                    destination: Place::from(unit_lcl),
+                    target: Some(target),
+                    unwind: UnwindAction::Terminate,
+                };
+            }
+            // hint::assert_unchecked states a validity contract as a UB-hint (deranged's
+            // new_unchecked). Within an inlined generator it becomes a filter, like the
+            // asserts; without this rewrite Kani checks it and reports "Rust intrinsic
+            // assumption failed" for out-of-range generated arguments.
+            TerminatorKind::Call { func, args, target, .. }
+                if func.ty(body.locals()).is_ok_and(|fn_ty| {
+                    matches!(fn_ty.kind(),
+                        TyKind::RigidTy(RigidTy::FnDef(def, _))
+                            if def.name().contains("assert_unchecked"))
+                }) =>
+            {
+                let cond = args[0].clone();
+                let target = target.expect("assert_unchecked has a return target");
+                let func_lcl = body.new_local(assume_inst.ty(), span, Mutability::Not);
+                let unit_lcl = body.new_local(Ty::new_tuple(&[]), span, Mutability::Mut);
+                bb.terminator.kind = TerminatorKind::Call {
+                    func: Operand::Copy(Place::from(func_lcl)),
+                    args: vec![cond],
+                    destination: Place::from(unit_lcl),
+                    target: Some(target),
+                    unwind: UnwindAction::Terminate,
+                };
+            }
+            TerminatorKind::Call { func, .. } if is_panic_call(tcx, func, body.locals()) => {
+                // assume(false); unreachable
+                let false_lcl = body.new_local(Ty::bool_ty(), span, Mutability::Mut);
+                bb.statements.push(Statement {
+                    kind: StatementKind::Assign(
+                        Place::from(false_lcl),
+                        Rvalue::Use(Operand::Constant(ConstOperand {
+                            span,
+                            user_ty: None,
+                            const_: MirConst::from_bool(false),
+                        })),
+                    ),
+                    span,
+                });
+                let func_lcl = body.new_local(assume_inst.ty(), span, Mutability::Not);
+                let unit_lcl = body.new_local(Ty::new_tuple(&[]), span, Mutability::Mut);
+                bb.terminator.kind = TerminatorKind::Call {
+                    func: Operand::Copy(Place::from(func_lcl)),
+                    args: vec![Operand::Move(Place::from(false_lcl))],
+                    destination: Place::from(unit_lcl),
+                    target: Some(block_offset + n_callee + n_unreach),
+                    unwind: UnwindAction::Terminate,
+                };
+                n_unreach += 1;
+            }
+            _ => {}
+        }
+        new_blocks.push(bb);
+    }
+
+    // Pass 2: split the caller and append everything at the precomputed indices.
+    let placeholder = Terminator { kind: TerminatorKind::Goto { target: block_offset }, span };
+    let (_goto_bb, actual_continuation) = body.split_with_terminator(source, placeholder);
+    assert_eq!(actual_continuation, continuation);
+    for bb in new_blocks {
+        body.push_raw_bb(bb);
+    }
+    for _ in 0..n_unreach {
+        body.push_raw_bb(BasicBlock {
+            statements: vec![],
+            terminator: Terminator { kind: TerminatorKind::Unreachable, span },
+        });
+    }
+    Some(ret_lcl)
+}
+
 /// If `ty` has a scalar layout with a restricted valid range (a niche), append
 /// `kani::assume(<raw bits of the value in place_local> in valid_range)`.
 /// Values outside the niche are language-level invalid (rustc packs enum variants into the
@@ -756,6 +1049,71 @@ impl AutomaticArbitraryPass {
 }
 impl AutomaticArbitraryPass {
     /// Overwrite the default `kani::any()` implementation `body` for a struct with private
+    /// fields by inlining an assert-guarded representation constructor with nondeterministic
+    /// arguments and panic paths converted into assumptions
+    /// (c.f. [find_unchecked_constructor][crate::kani_middle::find_unchecked_constructor]).
+    /// Returns None if the constructor body contains constructs the inliner does not support.
+    fn generate_unchecked_ctor_body(
+        &self,
+        tcx: TyCtxt,
+        ctor: Instance,
+        ty: Ty,
+        body: Body,
+    ) -> Option<Body> {
+        let mut new_body = MutableBody::from(body);
+        new_body.clear_body(TerminatorKind::Unreachable);
+        let mut source = SourceInstruction::Terminator { bb: 0 };
+        let mut invariant_cache = FxHashMap::default();
+        let ctor_sig = ctor.ty().kind().fn_sig().unwrap().skip_binder();
+        let arg_locals: Vec<Local> = ctor_sig
+            .inputs()
+            .iter()
+            .map(|input_ty| {
+                call_kani_any_for_ty(
+                    tcx,
+                    self.kani_any,
+                    self.kani_assume,
+                    self.kani_any_ptr,
+                    self.kani_any_slice_ref,
+                    self.kani_any_str_ref,
+                    self.kani_bounded_any,
+                    self.kani_assume_safe,
+                    &self.smart_pointer_models,
+                    &mut new_body,
+                    *input_ty,
+                    Mutability::Not,
+                    &mut source,
+                    &mut invariant_cache,
+                )
+            })
+            .collect();
+        let ret_lcl = inline_with_assumed_panics(
+            tcx,
+            self.kani_assume,
+            self.kani_assert,
+            &mut new_body,
+            &mut source,
+            ctor,
+            &arg_locals,
+            ty,
+        )?;
+        // RETURN_LOCAL = move ret; return
+        new_body.assign_to(
+            Place::from(0),
+            Rvalue::Use(Operand::Move(Place::from(ret_lcl))),
+            &mut source,
+            InsertPosition::Before,
+        );
+        let span = source.span(new_body.blocks());
+        new_body.insert_terminator(
+            &mut source,
+            InsertPosition::Before,
+            Terminator { kind: TerminatorKind::Return, span },
+        );
+        Some(new_body.into())
+    }
+
+    /// Overwrite the default `kani::any()` implementation `body` for a struct with private
     /// fields by calling a public constructor with nondeterministic arguments
     /// (`--constructor-args`). The returned body is equivalent to:
     /// ```ignore
@@ -790,6 +1148,7 @@ impl AutomaticArbitraryPass {
                 let lcl = call_kani_any_for_ty(
                     tcx,
                     self.kani_any,
+                    self.kani_assume,
                     self.kani_any_ptr,
                     self.kani_any_slice_ref,
                     self.kani_any_str_ref,

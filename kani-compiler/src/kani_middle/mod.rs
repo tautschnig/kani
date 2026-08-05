@@ -424,6 +424,8 @@ pub fn scalar_niche(tcx: TyCtxt, ty: Ty) -> Option<ScalarNiche> {
         return None;
     }
     Some(ScalarNiche { bits, start: valid_range.start, end: valid_range.end })
+}
+
 /// Whether generating a value of `ty` (under `--constructor-args`) would use constructor-based
 /// generation for some ADT reachable in `ty`'s type tree: an ADT with a private field and a
 /// viable public constructor. Used to mark such harnesses "(ctor)" in reports, since their
@@ -457,7 +459,9 @@ pub fn uses_ctor_generation(
             }
             if def.kind() == AdtKind::Struct
                 && adt_has_private_field_check(tcx, def)
-                && find_arbitrary_constructor(tcx, ty, kani_any_def, ty_arbitrary_cache).is_some()
+                && (find_unchecked_constructor(tcx, ty, kani_any_def, ty_arbitrary_cache).is_some()
+                    || find_arbitrary_constructor(tcx, ty, kani_any_def, ty_arbitrary_cache)
+                        .is_some())
             {
                 return true;
             }
@@ -521,6 +525,81 @@ pub enum CtorReturn {
     Direct,
     OptionOf,
     ResultOf,
+}
+
+/// Search `ty`'s inherent impls for an assert-guarded *representation constructor*: an
+/// associated function returning `Self` directly whose preconditions are stated as
+/// (debug_)asserts rather than validated returns — typically `unsafe`, doc-hidden or
+/// `_unchecked`-named builders exported for macro use (e.g. time's `Date::from_parts`).
+/// Under `--constructor-args`, such a constructor is inlined with panic paths converted to
+/// assumptions (c.f. `automatic::inline_with_assumed_panics`), so its own assertions filter
+/// the nondeterministic arguments down to exactly the values the crate considers valid.
+/// Visibility is irrelevant (the body is inlined, not called). Prefers more arguments over
+/// fewer; ties broken by definition order.
+pub fn find_unchecked_constructor(
+    tcx: TyCtxt,
+    ty: Ty,
+    kani_any_def: FnDef,
+    ty_arbitrary_cache: &mut FxHashMap<Ty, bool>,
+) -> Option<Instance> {
+    let TyKind::RigidTy(RigidTy::Adt(adt_def, ref adt_args)) = ty.kind() else {
+        return None;
+    };
+    let adt_did = rustc_internal::internal(tcx, adt_def.def_id());
+    let mut best: Option<(Instance, usize)> = None;
+    for &impl_did in tcx.inherent_impls(adt_did) {
+        for &item in tcx.associated_item_def_ids(impl_did) {
+            if !tcx.def_kind(item).is_fn_like() || tcx.associated_item(item).is_method() {
+                continue;
+            }
+            if tcx
+                .generics_of(item)
+                .own_params
+                .iter()
+                .any(|p| !matches!(p.kind, rustc_middle::ty::GenericParamDefKind::Lifetime))
+            {
+                continue;
+            }
+            let Some(ctor_def) = to_fn_def(tcx, item) else { continue };
+            // For generic ADTs (e.g. deranged's RangedI32<MIN, MAX>), instantiate the
+            // constructor with the ADT's own generic arguments: for inherent impls whose
+            // parameters mirror the type's, this is the correct substitution; when it is
+            // not, resolution fails and the constructor is skipped.
+            let Ok(instance) = Instance::resolve(ctor_def, adt_args) else {
+                continue;
+            };
+            if !instance.has_body() {
+                continue;
+            }
+            let TyKind::RigidTy(RigidTy::FnDef(..)) = instance.ty().kind() else { continue };
+            let Some(binder) = instance.ty().kind().fn_sig() else { continue };
+            let fn_sig = binder.skip_binder();
+            if fn_sig.output() != ty {
+                continue;
+            }
+            // The unchecked-builder heuristic: unsafe, doc-hidden, or *_unchecked-named.
+            let name = tcx.item_name(item).to_string();
+            let is_unchecked = fn_sig.safety == rustc_public::mir::Safety::Unsafe
+                || tcx.is_doc_hidden(item)
+                || name.contains("unchecked");
+            if !is_unchecked {
+                continue;
+            }
+            if fn_sig.inputs().is_empty()
+                || !fn_sig
+                    .inputs()
+                    .iter()
+                    .all(|input| implements_arbitrary(*input, kani_any_def, ty_arbitrary_cache))
+            {
+                continue;
+            }
+            let n_args = fn_sig.inputs().len();
+            if best.as_ref().is_none_or(|(_, best_n)| n_args > *best_n) {
+                best = Some((instance, n_args));
+            }
+        }
+    }
+    best.map(|(inst, _)| inst)
 }
 
 /// Search `ty`'s inherent impls for a public associated function usable as a constructor:
