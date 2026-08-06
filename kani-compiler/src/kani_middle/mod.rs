@@ -457,6 +457,19 @@ pub struct ScalarNiche {
     pub end: u128,
 }
 
+/// The bit width of a scalar-ABI type (integer primitives and enum discriminant types).
+pub fn scalar_width_bits(tcx: TyCtxt, ty: Ty) -> Option<u64> {
+    use rustc_abi::{BackendRepr, Primitive, Scalar};
+    let internal_ty = rustc_internal::internal(tcx, ty);
+    let layout = tcx
+        .layout_of(rustc_middle::ty::TypingEnv::fully_monomorphized().as_query_input(internal_ty))
+        .ok()?;
+    let BackendRepr::Scalar(scalar) = layout.backend_repr else { return None };
+    let Scalar::Initialized { value, .. } = scalar else { return None };
+    let Primitive::Int(int, _) = value else { return None };
+    Some(int.size().bits())
+}
+
 pub fn scalar_niche(tcx: TyCtxt, ty: Ty) -> Option<ScalarNiche> {
     use rustc_abi::{BackendRepr, Primitive, Scalar};
     let internal_ty = rustc_internal::internal(tcx, ty);
@@ -536,11 +549,9 @@ pub fn uses_ctor_generation(
                 return true;
             }
             // Mined-invariant assumptions are heuristic filters like constructor-based
-            // generation, so harnesses using them carry the same marker.
-            if def.kind() == AdtKind::Struct
-                && !mined_invariants::mine_self_assert_conjuncts(tcx, ty, kani_assert_def)
-                    .is_empty()
-            {
+            // generation, so harnesses using them carry the same marker (structs and
+            // enums alike).
+            if !mined_invariants::mine_self_assert_conjuncts(tcx, ty, kani_assert_def).is_empty() {
                 return true;
             }
             def.variants_iter().any(|variant| {

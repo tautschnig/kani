@@ -659,6 +659,25 @@ fn build_mined_expr(
             );
             lcl
         }
+        MinedExpr::DowncastField(variant, path) => {
+            // Reads the variant's field regardless of the actual discriminant; consumers
+            // guard the enclosing conjunct with `discriminant != variant || ...`, so the
+            // read value is irrelevant on other variants (the read itself is byte-level
+            // and harmless to CBMC).
+            let (_, leaf_ty) = *path.last().unwrap();
+            let mut projection =
+                vec![ProjectionElem::Downcast(rustc_public::ty::VariantIdx::to_val(*variant))];
+            projection.extend(path.iter().map(|(idx, ty)| ProjectionElem::Field(*idx, *ty)));
+            let place = Place { local: value_local, projection };
+            let lcl = body.new_local(leaf_ty, span, Mutability::Not);
+            body.assign_to(
+                Place::from(lcl),
+                Rvalue::Use(Operand::Copy(place)),
+                source,
+                InsertPosition::Before,
+            );
+            lcl
+        }
         MinedExpr::Const(_, c) => {
             let ty = c.const_.ty();
             let lcl = body.new_local(ty, span, Mutability::Not);
@@ -702,20 +721,112 @@ fn build_mined_expr(
     }
 }
 
+/// The enum variant a conjunct is guarded by, if any: mining produces conjuncts whose
+/// downcast field reads all target the assert's match arm, so a single variant governs the
+/// whole expression.
+fn conjunct_guard_variant(expr: &MinedExpr) -> Option<usize> {
+    match expr {
+        MinedExpr::Field(_) | MinedExpr::Const(_, _) => None,
+        MinedExpr::DowncastField(v, _) => Some(*v),
+        MinedExpr::BinOp(_, a, b) => {
+            conjunct_guard_variant(a).or_else(|| conjunct_guard_variant(b))
+        }
+        MinedExpr::UnOp(_, a) => conjunct_guard_variant(a),
+    }
+}
+
+/// Build the final condition local for a conjunct over `value_local`: the raw expression
+/// for struct conjuncts, or `discriminant(value) != variant || expr` for variant-guarded
+/// (enum) conjuncts, making the claim vacuously true on other variants.
+fn build_guarded_conjunct(
+    tcx: TyCtxt,
+    body: &mut MutableBody,
+    source: &mut SourceInstruction,
+    value_local: Local,
+    value_ty: Ty,
+    expr: &MinedExpr,
+) -> Option<Local> {
+    let raw = build_mined_expr(body, source, value_local, expr);
+    let Some(variant) = conjunct_guard_variant(expr) else { return Some(raw) };
+    let span = source.span(body.blocks());
+    // discriminant(value)
+    let discr_ty = value_ty.kind().discriminant_ty()?;
+    let discr_lcl = body.new_local(discr_ty, span, Mutability::Not);
+    body.assign_to(
+        Place::from(discr_lcl),
+        Rvalue::Discriminant(Place::from(value_local)),
+        source,
+        InsertPosition::Before,
+    );
+    // Transmute to a same-width uint for the comparison (as assume_scalar_niche does).
+    let niche_bits = crate::kani_middle::scalar_width_bits(tcx, discr_ty)?;
+    let uint_ty = match niche_bits {
+        8 => UintTy::U8,
+        16 => UintTy::U16,
+        32 => UintTy::U32,
+        64 => UintTy::U64,
+        128 => UintTy::U128,
+        _ => return Some(raw),
+    };
+    let raw_ty = Ty::from_rigid_kind(RigidTy::Uint(uint_ty));
+    let discr_uint = body.new_local(raw_ty, span, Mutability::Not);
+    body.assign_to(
+        Place::from(discr_uint),
+        Rvalue::Cast(CastKind::Transmute, Operand::Copy(Place::from(discr_lcl)), raw_ty),
+        source,
+        InsertPosition::Before,
+    );
+    let TyKind::RigidTy(RigidTy::Adt(adt_def, _)) = value_ty.kind() else { return Some(raw) };
+    let discr_val =
+        adt_def.discriminant_for_variant(rustc_public::ty::VariantIdx::to_val(variant)).val;
+    let mask = if niche_bits == 128 { u128::MAX } else { (1u128 << niche_bits) - 1 };
+    let variant_const = Operand::Constant(ConstOperand {
+        span,
+        user_ty: None,
+        const_: MirConst::try_from_uint(discr_val & mask, uint_ty).ok()?,
+    });
+    let bool_ty = Ty::bool_ty();
+    let ne_lcl = body.new_local(bool_ty, span, Mutability::Not);
+    body.assign_to(
+        Place::from(ne_lcl),
+        Rvalue::BinaryOp(BinOp::Ne, Operand::Copy(Place::from(discr_uint)), variant_const),
+        source,
+        InsertPosition::Before,
+    );
+    let cond_lcl = body.new_local(bool_ty, span, Mutability::Not);
+    body.assign_to(
+        Place::from(cond_lcl),
+        Rvalue::BinaryOp(
+            BinOp::BitOr,
+            Operand::Move(Place::from(ne_lcl)),
+            Operand::Move(Place::from(raw)),
+        ),
+        source,
+        InsertPosition::Before,
+    );
+    Some(cond_lcl)
+}
+
 /// Emit `kani::assume(<conjunct>)` for each mined conjunct of `ty` over the value in
 /// `value_local`. Mined conjuncts are the type's own assertions (a necessary condition of
 /// the values the crate's code accepts), so assuming them filters generated values the same
 /// way constructor-assert mining does, at lower formula cost than constructor inlining.
 fn assume_mined_invariants(
+    tcx: TyCtxt,
     kani_assume: FnDef,
     body: &mut MutableBody,
     source: &mut SourceInstruction,
     value_local: Local,
+    value_ty: Ty,
     conjuncts: &[MinedConjunct],
 ) {
     let assume_inst = Instance::resolve(kani_assume, &GenericArgs(vec![])).unwrap();
     for conjunct in conjuncts {
-        let cond = build_mined_expr(body, source, value_local, &conjunct.expr);
+        let Some(cond) =
+            build_guarded_conjunct(tcx, body, source, value_local, value_ty, &conjunct.expr)
+        else {
+            continue;
+        };
         let span = source.span(body.blocks());
         let unit_lcl = body.new_local(Ty::new_tuple(&[]), span, Mutability::Not);
         body.insert_call(
@@ -734,16 +845,86 @@ fn assume_mined_invariants(
 /// property class (the mined predicate is heuristic; a failure means the returned value
 /// would trip the type's own assertions when used).
 fn check_mined_invariants(
+    tcx: TyCtxt,
     kani_assert: FnDef,
     body: &mut MutableBody,
     source: &mut SourceInstruction,
     value_local: Local,
     ty: Ty,
+    // For payloads peeled out of Option/Result returns: (wrapper local, ok variant idx,
+    // wrapper ty). Each check is guarded with `wrapper discriminant != ok || conjunct`, so
+    // None/Err returns pass vacuously (the payload read is a harmless byte-level read).
+    wrapper: Option<(Local, usize, Ty)>,
     conjuncts: &[MinedConjunct],
 ) {
     let assert_inst = Instance::resolve(kani_assert, &GenericArgs(vec![])).unwrap();
+    // Compute the wrapper guard (discriminant != ok) once.
+    let wrapper_ne: Option<Local> = wrapper.and_then(|(wlcl, ok_idx, wty)| {
+        let span = source.span(body.blocks());
+        let discr_ty = wty.kind().discriminant_ty()?;
+        let discr_lcl = body.new_local(discr_ty, span, Mutability::Not);
+        body.assign_to(
+            Place::from(discr_lcl),
+            Rvalue::Discriminant(Place::from(wlcl)),
+            source,
+            InsertPosition::Before,
+        );
+        let bits = crate::kani_middle::scalar_width_bits(tcx, discr_ty)?;
+        let uint_ty = match bits {
+            8 => UintTy::U8,
+            16 => UintTy::U16,
+            32 => UintTy::U32,
+            64 => UintTy::U64,
+            128 => UintTy::U128,
+            _ => return None,
+        };
+        let raw_ty = Ty::from_rigid_kind(RigidTy::Uint(uint_ty));
+        let discr_uint = body.new_local(raw_ty, span, Mutability::Not);
+        body.assign_to(
+            Place::from(discr_uint),
+            Rvalue::Cast(CastKind::Transmute, Operand::Copy(Place::from(discr_lcl)), raw_ty),
+            source,
+            InsertPosition::Before,
+        );
+        let TyKind::RigidTy(RigidTy::Adt(adt_def, _)) = wty.kind() else { return None };
+        let discr_val =
+            adt_def.discriminant_for_variant(rustc_public::ty::VariantIdx::to_val(ok_idx)).val;
+        let mask = if bits == 128 { u128::MAX } else { (1u128 << bits) - 1 };
+        let c = Operand::Constant(ConstOperand {
+            span,
+            user_ty: None,
+            const_: MirConst::try_from_uint(discr_val & mask, uint_ty).ok()?,
+        });
+        let ne = body.new_local(Ty::bool_ty(), span, Mutability::Not);
+        body.assign_to(
+            Place::from(ne),
+            Rvalue::BinaryOp(BinOp::Ne, Operand::Copy(Place::from(discr_uint)), c),
+            source,
+            InsertPosition::Before,
+        );
+        Some(ne)
+    });
     for conjunct in conjuncts {
-        let cond = build_mined_expr(body, source, value_local, &conjunct.expr);
+        let Some(mut cond) =
+            build_guarded_conjunct(tcx, body, source, value_local, ty, &conjunct.expr)
+        else {
+            continue;
+        };
+        if let Some(ne) = wrapper_ne {
+            let span = source.span(body.blocks());
+            let ored = body.new_local(Ty::bool_ty(), span, Mutability::Not);
+            body.assign_to(
+                Place::from(ored),
+                Rvalue::BinaryOp(
+                    BinOp::BitOr,
+                    Operand::Copy(Place::from(ne)),
+                    Operand::Move(Place::from(cond)),
+                ),
+                source,
+                InsertPosition::Before,
+            );
+            cond = ored;
+        }
         let span = source.span(body.blocks());
         let msg = format!(
             "mined invariant of `{ty}` violated by return value (asserted in {})",
@@ -1170,15 +1351,13 @@ fn call_kani_any_for_ty(
 
         // Under --constructor-args (the heuristic-filter umbrella), assume the type's mined
         // invariant conjuncts (its own methods' assertions) for the generated value.
-        if constructor_args
-            && matches!(ty.kind(), TyKind::RigidTy(RigidTy::Adt(def, _)) if def.kind() == AdtKind::Struct)
-        {
+        if constructor_args && matches!(ty.kind(), TyKind::RigidTy(RigidTy::Adt(..))) {
             let conjuncts = mined_cache
                 .entry(ty)
                 .or_insert_with(|| mine_self_assert_conjuncts(tcx, ty, kani_assert));
             if !conjuncts.is_empty() {
                 let conjuncts = conjuncts.clone();
-                assume_mined_invariants(kani_assume, body, source, lcl, &conjuncts);
+                assume_mined_invariants(tcx, kani_assume, body, source, lcl, ty, &conjuncts);
             }
         }
 
@@ -1889,10 +2068,15 @@ impl TransformPass for AutomaticHarnessPass {
         // logged follow-up).
         if self.check_invariants {
             let ret_ty = func_to_verify_ret.ty;
+            // Peel the return type down to a checkable ADT value: direct T, &T, and the
+            // payloads of Option<T>/Result<T, E>. For the latter two, the payload is read
+            // via a downcast (harmless byte-level read on the other variant) and every
+            // conjunct is guarded with `discriminant != Some/Ok || conjunct`, making the
+            // check vacuously true for None/Err returns.
+            let mut wrapper_guard: Option<(usize, Ty)> = None; // (ok variant idx, wrapper ty)
             let (check_ty, check_lcl) = match ret_ty.kind() {
                 TyKind::RigidTy(RigidTy::Ref(_, inner, _))
-                    if matches!(inner.kind(),
-                        TyKind::RigidTy(RigidTy::Adt(d, _)) if d.kind() == AdtKind::Struct) =>
+                    if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Adt(..))) =>
                 {
                     // Deref into a temp of the pointee type.
                     let span = source.span(harness_body.blocks());
@@ -1908,9 +2092,45 @@ impl TransformPass for AutomaticHarnessPass {
                     );
                     (inner, Some(tmp))
                 }
-                TyKind::RigidTy(RigidTy::Adt(d, _)) if d.kind() == AdtKind::Struct => {
-                    (ret_ty, Some(ret_lcl))
+                TyKind::RigidTy(RigidTy::Adt(d, ref wargs))
+                    if matches!(
+                        d.name().as_str(),
+                        "std::option::Option"
+                            | "core::option::Option"
+                            | "std::result::Result"
+                            | "core::result::Result"
+                    ) =>
+                {
+                    let ok_idx = if d.name().contains("Option") { 1 } else { 0 };
+                    let payload = wargs.0.iter().find_map(|a| match a {
+                        GenericArgKind::Type(t) => Some(*t),
+                        _ => None,
+                    });
+                    match payload {
+                        Some(pt) if matches!(pt.kind(), TyKind::RigidTy(RigidTy::Adt(..))) => {
+                            let span = source.span(harness_body.blocks());
+                            let tmp = harness_body.new_local(pt, span, Mutability::Not);
+                            harness_body.assign_to(
+                                Place::from(tmp),
+                                Rvalue::Use(Operand::Copy(Place {
+                                    local: ret_lcl,
+                                    projection: vec![
+                                        ProjectionElem::Downcast(
+                                            rustc_public::ty::VariantIdx::to_val(ok_idx),
+                                        ),
+                                        ProjectionElem::Field(0, pt),
+                                    ],
+                                })),
+                                &mut source,
+                                InsertPosition::Before,
+                            );
+                            wrapper_guard = Some((ok_idx, ret_ty));
+                            (pt, Some(tmp))
+                        }
+                        _ => (ret_ty, None),
+                    }
                 }
+                TyKind::RigidTy(RigidTy::Adt(..)) => (ret_ty, Some(ret_lcl)),
                 _ => (ret_ty, None),
             };
             if let Some(lcl) = check_lcl {
@@ -1920,11 +2140,13 @@ impl TransformPass for AutomaticHarnessPass {
                     .clone();
                 if !conjuncts.is_empty() {
                     check_mined_invariants(
+                        tcx,
                         self.kani_assert,
                         &mut harness_body,
                         &mut source,
                         lcl,
                         check_ty,
+                        wrapper_guard.map(|(ok, wty)| (ret_lcl, ok, wty)),
                         &conjuncts,
                     );
                 }

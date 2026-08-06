@@ -53,3 +53,75 @@ pub fn buggy_make_day(seed: u16) -> Day {
 pub fn good_make_day(seed: u16) -> Day {
     Day { value: (seed % 366) + 1 }
 }
+
+// --- V2 cases ---
+
+// Getter-based invariant: the assert goes through self.level() (pure getter) — with
+// one-level getter inlining, this mines like a direct field read (2 methods → invariant).
+pub struct Tank {
+    level: u8,
+}
+
+impl Tank {
+    pub fn level(&self) -> u8 {
+        self.level
+    }
+    pub fn a(&self) -> u8 {
+        assert!(self.level() <= 100);
+        self.level
+    }
+    pub fn b(&self) -> u8 {
+        assert!(self.level() <= 100);
+        100 - self.level
+    }
+}
+
+// TEST NOTE: previously a false alarm; with getter-inlined mining, PASSES.
+pub fn tank_user(t: Tank) -> u8 {
+    t.b()
+}
+
+// Result-returning producer: the mined Day invariant must be checked on the Ok payload;
+// this buggy producer FAILS; Err returns pass vacuously.
+pub fn buggy_try_make_day(seed: u16) -> Result<Day, ()> {
+    if seed > 1000 { Err(()) } else { Ok(Day { value: seed % 366 }) }
+}
+
+// TEST NOTE: correct Result producer — Ok payload valid, Err returns vacuously pass.
+pub fn good_try_make_day(seed: u16) -> Result<Day, ()> {
+    if seed > 1000 { Err(()) } else { Ok(Day { value: (seed % 366) + 1 }) }
+}
+
+// Enum whose variant invariant (Cm value <= 100) is asserted in two methods via match:
+// mined as a variant-guarded conjunct.
+pub enum Length {
+    Cm(u8),
+    Inch(u8),
+}
+
+impl Length {
+    pub fn cm_a(&self) -> u8 {
+        match self {
+            Length::Cm(v) => {
+                assert!(*v <= 100);
+                *v
+            }
+            Length::Inch(v) => *v,
+        }
+    }
+    pub fn cm_b(&self) -> u8 {
+        match self {
+            Length::Cm(v) => {
+                assert!(*v <= 100);
+                100 - *v
+            }
+            Length::Inch(v) => *v,
+        }
+    }
+}
+
+// TEST NOTE: previously a false alarm (generated Cm values above 100); with the
+// variant-guarded mined conjunct assumed, PASSES.
+pub fn length_user(l: Length) -> u8 {
+    l.cm_b()
+}

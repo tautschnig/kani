@@ -22,6 +22,7 @@ use rustc_public::mir::{
     BinOp, Body, ConstOperand, Operand, Place, Rvalue, StatementKind, TerminatorKind, UnOp,
 };
 use rustc_public::ty::{FnDef, RigidTy, Ty, TyKind};
+use rustc_public_bridge::IndexedVal;
 
 /// A conjunct must be asserted in at least this many distinct methods to be considered a
 /// type invariant rather than a method-local precondition.
@@ -32,6 +33,9 @@ pub const MIN_ASSERTING_METHODS: usize = 2;
 pub enum MinedExpr {
     /// A chain of field projections starting at the value itself, with the field type.
     Field(Vec<(usize, Ty)>),
+    /// A field chain under an enum variant downcast: only meaningful when the value's
+    /// discriminant equals the variant index (consumers guard with an implication).
+    DowncastField(usize, Vec<(usize, Ty)>),
     /// A constant: the canonical token (for equality/hashing across methods) plus the
     /// original operand (for re-materialization).
     Const(String, ConstOperand),
@@ -43,6 +47,9 @@ impl PartialEq for MinedExpr {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (MinedExpr::Field(a), MinedExpr::Field(b)) => a == b,
+            (MinedExpr::DowncastField(v1, a), MinedExpr::DowncastField(v2, b)) => {
+                v1 == v2 && a == b
+            }
             (MinedExpr::Const(a, _), MinedExpr::Const(b, _)) => a == b,
             (MinedExpr::BinOp(o1, a1, b1), MinedExpr::BinOp(o2, a2, b2)) => {
                 o1 == o2 && a1 == a2 && b1 == b2
@@ -58,6 +65,10 @@ impl std::hash::Hash for MinedExpr {
         std::mem::discriminant(self).hash(state);
         match self {
             MinedExpr::Field(path) => path.hash(state),
+            MinedExpr::DowncastField(v, path) => {
+                v.hash(state);
+                path.hash(state);
+            }
             MinedExpr::Const(token, _) => token.hash(state),
             MinedExpr::BinOp(op, a, b) => {
                 format!("{op:?}").hash(state);
@@ -76,6 +87,7 @@ impl MinedExpr {
     pub fn ty(&self) -> Option<Ty> {
         match self {
             MinedExpr::Field(path) => path.last().map(|(_, t)| *t),
+            MinedExpr::DowncastField(_, path) => path.last().map(|(_, t)| *t),
             MinedExpr::Const(_, c) => Some(c.const_.ty()),
             MinedExpr::BinOp(op, a, _) => match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -96,15 +108,25 @@ pub struct MinedConjunct {
     pub asserted_in: Vec<String>,
 }
 
-/// Whether `bb` post-dominates the entry block of `body` w.r.t. normal returns:
-/// every path from entry to a `Return` terminator passes through `bb`.
-fn postdominates_entry(body: &Body, bb: usize) -> bool {
-    // BFS from entry avoiding `bb`; if any Return block is reachable, `bb` does not
+/// Whether the expression contains a variant-downcast field read.
+pub fn conjunct_has_downcast(expr: &MinedExpr) -> bool {
+    match expr {
+        MinedExpr::Field(_) | MinedExpr::Const(_, _) => false,
+        MinedExpr::DowncastField(..) => true,
+        MinedExpr::BinOp(_, a, b) => conjunct_has_downcast(a) || conjunct_has_downcast(b),
+        MinedExpr::UnOp(_, a) => conjunct_has_downcast(a),
+    }
+}
+
+/// Whether `bb` post-dominates `from`/// Whether `bb` post-dominates `from` in `body` w.r.t. normal returns:
+/// every path from `from` to a `Return` terminator passes through `bb`.
+fn postdominates(body: &Body, from: usize, bb: usize) -> bool {
+    // BFS from `from` avoiding `bb`; if any Return block is reachable, `bb` does not
     // post-dominate.
     let mut seen = vec![false; body.blocks.len()];
-    let mut queue = vec![0usize];
-    seen[0] = true;
-    if bb == 0 {
+    let mut queue = vec![from];
+    seen[from] = true;
+    if bb == from {
         return true;
     }
     while let Some(cur) = queue.pop() {
@@ -158,35 +180,53 @@ fn extract_const(c: &ConstOperand) -> Option<MinedExpr> {
     Some(MinedExpr::Const(format!("{:?}", c.const_), c.clone()))
 }
 
-/// `self` is local 1; a place rooted at it with only Deref/Field projections is a field path.
+/// `self` is local 1; a place rooted at it with Deref/Field projections is a field path
+/// (an optional leading Downcast records the enum variant, for variant-guarded conjuncts).
 fn extract_place(body: &Body, place: &Place, depth: usize) -> Option<MinedExpr> {
     use rustc_public::mir::ProjectionElem;
     if place.local == 1 {
         let mut path = vec![];
+        let mut variant: Option<usize> = None;
         for elem in &place.projection {
             match elem {
                 ProjectionElem::Deref => {}
                 ProjectionElem::Field(idx, ty) => path.push((*idx, *ty)),
+                ProjectionElem::Downcast(v) if path.is_empty() && variant.is_none() => {
+                    variant = Some(v.to_index());
+                }
                 _ => return None,
             }
         }
         if path.is_empty() {
             return None; // whole-self uses are not field conditions
         }
-        return Some(MinedExpr::Field(path));
+        return Some(match variant {
+            Some(v) => MinedExpr::DowncastField(v, path),
+            None => MinedExpr::Field(path),
+        });
     }
-    // A temporary: find its unique defining assignment.
+    // A temporary dereferenced once: if it uniquely holds a reference, the deref cancels
+    // (match ergonomics bind payloads by reference: `v = &((*self) as Variant).0`).
+    if place.projection.len() == 1 && matches!(place.projection[0], ProjectionElem::Deref) {
+        let base = Place { local: place.local, projection: vec![] };
+        if let Some(inner) = unique_ref_def(body, &base) {
+            return extract_place(body, &inner, depth + 1);
+        }
+        return None;
+    }
+    // A temporary: find its unique defining assignment or defining call.
     if !place.projection.is_empty() {
         return None;
     }
     let mut def: Option<&Rvalue> = None;
+    let mut call_def: Option<&rustc_public::mir::Terminator> = None;
     for block in &body.blocks {
         for stmt in &block.statements {
             if let StatementKind::Assign(p, rv) = &stmt.kind
                 && p.local == place.local
             {
                 if p.projection.is_empty() {
-                    if def.is_some() {
+                    if def.is_some() || call_def.is_some() {
                         return None; // multiple assignments (e.g. short-circuit merge)
                     }
                     def = Some(rv);
@@ -195,12 +235,19 @@ fn extract_place(body: &Body, place: &Place, depth: usize) -> Option<MinedExpr> 
                 }
             }
         }
-        // Call destinations also define locals.
         if let TerminatorKind::Call { destination, .. } = &block.terminator.kind
             && destination.local == place.local
         {
-            return None; // defined by a call: outside the pure fragment
+            if def.is_some() || call_def.is_some() {
+                return None;
+            }
+            call_def = Some(&block.terminator);
         }
+    }
+    if let Some(term) = call_def {
+        // One-level getter inlining: a call to a pure accessor of `self` whose body is
+        // itself extractable (e.g. `self.len()` where len returns a field expression).
+        return extract_getter_call(body, term, depth);
     }
     match def? {
         Rvalue::Use(inner) => extract_expr(body, inner, depth + 1),
@@ -215,6 +262,121 @@ fn extract_place(body: &Body, place: &Place, depth: usize) -> Option<MinedExpr> 
         Rvalue::CopyForDeref(p) => extract_place(body, p, depth + 1),
         _ => None,
     }
+}
+
+/// Extract the expression computed by a getter call `self.m()`: the sole argument must be
+/// (a reference to) `self`, and the callee's return local must have a unique, extractable
+/// definition in terms of ITS `self` (which is the same value). Depth-limited.
+fn extract_getter_call(
+    body: &Body,
+    term: &rustc_public::mir::Terminator,
+    depth: usize,
+) -> Option<MinedExpr> {
+    if depth > 3 {
+        return None;
+    }
+    let TerminatorKind::Call { func, args, .. } = &term.kind else { return None };
+    // Sole argument: self (possibly behind a fresh reference temp).
+    if args.len() != 1 {
+        return None;
+    }
+    let self_rooted = match &args[0] {
+        Operand::Copy(p) | Operand::Move(p) => p.local == 1 || place_is_ref_to_self(body, p),
+        _ => false,
+    };
+    if !self_rooted {
+        return None;
+    }
+    let fn_ty = func.ty(body.locals()).ok()?;
+    let TyKind::RigidTy(RigidTy::FnDef(def, fn_args)) = fn_ty.kind() else { return None };
+    let inst = Instance::resolve(def, &fn_args).ok()?;
+    let callee = inst.body()?;
+    // Unique assignment to the return local, extractable in the callee's own self frame.
+    let mut ret_def: Option<MinedExpr> = None;
+    for block in &callee.blocks {
+        for stmt in &block.statements {
+            if let StatementKind::Assign(p, rv) = &stmt.kind
+                && p.local == 0
+            {
+                if ret_def.is_some() || !p.projection.is_empty() {
+                    return None;
+                }
+                ret_def = Some(match rv {
+                    Rvalue::Use(inner) => extract_expr(&callee, inner, depth + 1)?,
+                    Rvalue::BinaryOp(bop, a, b) => MinedExpr::BinOp(
+                        *bop,
+                        Box::new(extract_expr(&callee, a, depth + 1)?),
+                        Box::new(extract_expr(&callee, b, depth + 1)?),
+                    ),
+                    Rvalue::UnaryOp(uop, a) => {
+                        MinedExpr::UnOp(*uop, Box::new(extract_expr(&callee, a, depth + 1)?))
+                    }
+                    _ => return None,
+                });
+            }
+        }
+        if let TerminatorKind::Call { destination, .. } = &block.terminator.kind
+            && destination.local == 0
+        {
+            return None;
+        }
+    }
+    ret_def
+}
+
+/// If `p` (a projection-free temp) is uniquely defined as `&<place>`, return that place.
+fn unique_ref_def(body: &Body, p: &Place) -> Option<Place> {
+    let mut found: Option<Place> = None;
+    for block in &body.blocks {
+        for stmt in &block.statements {
+            if let StatementKind::Assign(dest, rv) = &stmt.kind
+                && dest.local == p.local
+                && dest.projection.is_empty()
+            {
+                match rv {
+                    Rvalue::Ref(_, _, inner) => {
+                        if found.is_some() {
+                            return None;
+                        }
+                        found = Some(inner.clone());
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        if let TerminatorKind::Call { destination, .. } = &block.terminator.kind
+            && destination.local == p.local
+        {
+            return None;
+        }
+    }
+    found
+}
+
+/// Whether `p` is a temp holding `&self`/// Whether `p` is a temp holding `&self` (defined once as `Ref(.., self-place)`).
+fn place_is_ref_to_self(body: &Body, p: &Place) -> bool {
+    if !p.projection.is_empty() {
+        return false;
+    }
+    let mut found = false;
+    for block in &body.blocks {
+        for stmt in &block.statements {
+            if let StatementKind::Assign(dest, rv) = &stmt.kind
+                && dest.local == p.local
+            {
+                match rv {
+                    Rvalue::Ref(_, _, inner) if inner.local == 1 => {
+                        if found {
+                            return false;
+                        }
+                        found = true;
+                    }
+                    _ => return false,
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Mine the invariant conjuncts of `ty` (a struct ADT) from its inherent `&self` methods.
@@ -265,10 +427,58 @@ pub fn mine_self_assert_conjuncts(tcx: TyCtxt, ty: Ty, kani_assert: FnDef) -> Ve
                 if def != kani_assert {
                     continue;
                 }
-                if !postdominates_entry(&body, bb_idx) {
+                // Unconditional claim (post-dominates entry), or a claim guarded by a
+                // match on self's discriminant (post-dominates that arm's entry): the
+                // latter yields a variant-guarded conjunct via the DowncastField reads in
+                // its expression.
+                let unconditional = postdominates(&body, 0, bb_idx);
+                let mut arm_guarded = false;
+                if !unconditional {
+                    'guard: for block in &body.blocks {
+                        let TerminatorKind::SwitchInt { discr, targets } = &block.terminator.kind
+                        else {
+                            continue;
+                        };
+                        // The switch must be on self's discriminant.
+                        let is_self_discr = match discr {
+                            Operand::Copy(p) | Operand::Move(p) => {
+                                p.projection.is_empty()
+                                    && body.blocks.iter().any(|b| {
+                                        b.statements.iter().any(|st| {
+                                            matches!(&st.kind,
+                                                StatementKind::Assign(d, Rvalue::Discriminant(src))
+                                                    if d.local == p.local && src.local == 1)
+                                        })
+                                    })
+                            }
+                            _ => false,
+                        };
+                        if !is_self_discr {
+                            continue;
+                        }
+                        for (_, target) in targets.branches() {
+                            if postdominates(&body, target, bb_idx) {
+                                arm_guarded = true;
+                                break 'guard;
+                            }
+                        }
+                        if postdominates(&body, targets.otherwise(), bb_idx) {
+                            arm_guarded = true;
+                            break 'guard;
+                        }
+                    }
+                }
+                if !unconditional && !arm_guarded {
                     continue;
                 }
                 let Some(expr) = extract_expr(&body, &args[0], 0) else { continue };
+                // Arm-guarded conjuncts must carry the variant via their downcast reads;
+                // unconditional conjuncts must not (a bare downcast read without its match
+                // would be under-guarded).
+                match (unconditional, conjunct_has_downcast(&expr)) {
+                    (true, true) | (false, false) => continue,
+                    _ => {}
+                }
                 if expr.ty() != Some(Ty::bool_ty()) {
                     continue;
                 }
