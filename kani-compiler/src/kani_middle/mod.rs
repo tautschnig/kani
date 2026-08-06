@@ -392,6 +392,19 @@ fn implements_invariant(
     res
 }
 
+/// If `ty` is `std::vec::IntoIter<T>`, return `T`.
+pub fn vec_into_iter_elem_ty(ty: Ty) -> Option<Ty> {
+    let TyKind::RigidTy(RigidTy::Adt(def, ref args)) = ty.kind() else { return None };
+    let name = def.name();
+    if name != "std::vec::IntoIter" && name != "alloc::vec::into_iter::IntoIter" {
+        return None;
+    }
+    args.0.iter().find_map(|a| match a {
+        GenericArgKind::Type(t) => Some(*t),
+        _ => None,
+    })
+}
+
 /// If `ty` is `Vec<T>` with the default allocator, return `T`.
 pub fn vec_elem_ty(ty: Ty) -> Option<Ty> {
     let TyKind::RigidTy(RigidTy::Adt(def, ref args)) = ty.kind() else { return None };
@@ -1063,6 +1076,11 @@ fn autoharness_supported_arg_ty(
         }
     };
 
+    // Function items (e.g. the nondet_fn models instantiating Fn-bounded type parameters)
+    // are zero-sized and generated as constants: ordinary support.
+    if matches!(ty.kind(), TyKind::RigidTy(RigidTy::FnDef(..))) {
+        return ArgSupport::Arbitrary;
+    }
     if let TyKind::RigidTy(RigidTy::RawPtr(inner_ty, _)) = ty.kind() {
         // Raw pointers (of any nesting depth) are supported as long as the base pointee
         // implements or can derive Arbitrary; the generated pointer states (null, out of
@@ -1118,6 +1136,12 @@ fn autoharness_supported_arg_ty(
         {
             // Smart pointers of (implementable or derivable) pointees cover exactly the values
             // of the pointee, so they are ordinary (non-bounded) support.
+            ArgSupport::Arbitrary
+        } else if let Some(elem) = vec_into_iter_elem_ty(ty)
+            && slice_elem_unbounded_ok(tcx, elem)
+            && unbounded_slice_available
+        {
+            // Iterator instantiations (std::vec::IntoIter<T>) over unbounded vectors.
             ArgSupport::Arbitrary
         } else if let Some(elem) = vec_elem_ty(ty)
             && slice_elem_unbounded_ok(tcx, elem)

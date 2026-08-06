@@ -75,8 +75,18 @@ pub enum KaniModel {
     AnySliceRef,
     #[strum(serialize = "AnySliceMutUnboundedModel")]
     AnySliceMutUnbounded,
+    #[strum(serialize = "NondetFn0Model")]
+    NondetFn0,
+    #[strum(serialize = "NondetFn1Model")]
+    NondetFn1,
+    #[strum(serialize = "NondetFn2Model")]
+    NondetFn2,
+    #[strum(serialize = "NondetFn3Model")]
+    NondetFn3,
     #[strum(serialize = "AnySliceRefUnboundedModel")]
     AnySliceRefUnbounded,
+    #[strum(serialize = "AnyVecIntoIterModel")]
+    AnyVecIntoIter,
     #[strum(serialize = "AnyVecUnboundedModel")]
     AnyVecUnbounded,
     #[strum(serialize = "AnyStrRefModel")]
@@ -202,7 +212,12 @@ impl KaniModel {
                 | KaniModel::AnyRc
                 | KaniModel::AnySliceMutUnbounded
                 | KaniModel::AnySliceRefUnbounded
+                | KaniModel::AnyVecIntoIter
                 | KaniModel::AnyVecUnbounded
+                | KaniModel::NondetFn0
+                | KaniModel::NondetFn1
+                | KaniModel::NondetFn2
+                | KaniModel::NondetFn3
         )
     }
 }

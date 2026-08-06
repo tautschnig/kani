@@ -1,0 +1,9 @@
+| cargo_autoharness_fn_bounds | apply_generic    | Generic Function: no candidate type (i32, u32, usize, u8, i64, u64, f64, f32, bool, char and 10 types implementing the required traits) satisfies the function's trait bounds |
+	 - Status: SATISFIED
+| cargo_autoharness_fn_bounds | apply::<fn(u8) -> u8 {kani::arbitrary::nondet_fn1::<u8, u8>}>               | #[kani::proof]            | Success             |
+| cargo_autoharness_fn_bounds | branches::<fn(u8) -> bool {kani::arbitrary::nondet_fn1::<u8, bool>}>        | #[kani::proof]            | Success             |
+| cargo_autoharness_fn_bounds | first_item::<std::vec::IntoIter<u32>>                                       | #[kani::proof]            | Success             |
+| cargo_autoharness_fn_bounds | run_once::<fn() {kani::arbitrary::nondet_fn0::<()>}>                        | #[kani::proof]            | Success             |
+| cargo_autoharness_fn_bounds | apply_buggy::<fn(u8) -> u8 {kani::arbitrary::nondet_fn1::<u8, u8>}>         | #[kani::proof]            | Failure             |
+| cargo_autoharness_fn_bounds | fold2::<fn(u32, u32) -> u32 {kani::arbitrary::nondet_fn2::<u32, u32, u32>}> | #[kani::proof]            | Failure             |
+| cargo_autoharness_fn_bounds | sum_iter::<std::vec::IntoIter<u8>>                                          | #[kani::proof]            | Failure             |

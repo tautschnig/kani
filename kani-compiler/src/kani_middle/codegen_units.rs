@@ -112,6 +112,13 @@ impl CodegenUnits {
                     *kani_fns.get(&KaniModel::Any.into()).unwrap(),
                     *kani_fns.get(&KaniModel::BoundedAny.into()).unwrap(),
                     *kani_fns.get(&KaniHook::Assert.into()).unwrap(),
+                    [
+                        kani_fns.get(&KaniModel::NondetFn0.into()).copied(),
+                        kani_fns.get(&KaniModel::NondetFn1.into()).copied(),
+                        kani_fns.get(&KaniModel::NondetFn2.into()).copied(),
+                        kani_fns.get(&KaniModel::NondetFn3.into()).copied(),
+                    ],
+                    kani_fns.get(&KaniModel::AnyVecIntoIter.into()).copied(),
                     kani_fns.contains_key(&KaniModel::AnySliceRefUnbounded.into()),
                     SmartPointerModels::from_kani_functions(kani_fns),
                 );
@@ -518,7 +525,150 @@ fn args_satisfy_predicates(tcx: TyCtxt, def: FnDef, args: &GenericArgs) -> bool 
 /// Return the reason (to be attached to [AutoHarnessSkipReason::GenericFn]) if no candidate
 /// satisfies the bounds, or if the function has const generic parameters, which we do not
 /// support instantiating yet.
-fn choose_generic_instantiation(tcx: TyCtxt, fn_item: CrateItem) -> Result<Instance, String> {
+/// For type parameters bound by `Fn`/`FnMut`/`FnOnce`, derive a candidate instantiation:
+/// the *function item type* of the matching-arity `kani::arbitrary::nondet_fn<N>` model,
+/// instantiated with the bound's argument and return types. Function items implement all
+/// three `Fn` traits and are zero-sized; the models return a fresh nondeterministic value
+/// per call, over-approximating every real closure's behavior.
+///
+/// Returns a map from parameter index (among the identity args) to candidate types.
+/// Signature types that themselves mention generic parameters are only usable if those
+/// parameters appear EARLIER in the parameter list (they are substituted with the current
+/// choice by the caller); v1 keeps it simple and only admits fully concrete signatures.
+fn fn_bound_candidates(
+    tcx: TyCtxt,
+    def: FnDef,
+    nondet_fns: &[Option<FnDef>; 4],
+) -> FxHashMap<usize, Vec<Ty>> {
+    let def_id = rustc_internal::internal(tcx, def.def_id());
+    let mut out: FxHashMap<usize, Vec<Ty>> = FxHashMap::default();
+    let fn_once = tcx.lang_items().fn_once_trait();
+    let fn_mut = tcx.lang_items().fn_mut_trait();
+    let fn_tr = tcx.lang_items().fn_trait();
+    // Collect Fn-ish trait predicates keyed by the self param index, with tupled inputs.
+    let mut sig_inputs: FxHashMap<usize, rustc_middle::ty::Ty> = FxHashMap::default();
+    for (predicate, _span) in tcx.predicates_of(def_id).predicates {
+        let Some(tp) = predicate.as_trait_clause() else { continue };
+        let tp = tp.skip_binder();
+        let tid = Some(tp.def_id());
+        if tid != fn_once && tid != fn_mut && tid != fn_tr {
+            continue;
+        }
+        let rustc_middle::ty::TyKind::Param(param_ty) = tp.self_ty().kind() else { continue };
+        // Second generic arg of the Fn traits is the tupled inputs.
+        let Some(inputs) = tp.trait_ref.args.get(1).and_then(|a| a.as_type()) else {
+            continue;
+        };
+        sig_inputs.insert(param_ty.index as usize, inputs);
+    }
+    if sig_inputs.is_empty() {
+        return out;
+    }
+    // The return type comes from the FnOnce::Output projection bound.
+    let mut sig_output: FxHashMap<usize, rustc_middle::ty::Ty> = FxHashMap::default();
+    for (predicate, _span) in tcx.predicates_of(def_id).predicates {
+        let Some(proj) = predicate.as_projection_clause() else { continue };
+        let proj = proj.skip_binder();
+        let rustc_middle::ty::TyKind::Param(param_ty) = proj.projection_term.self_ty().kind()
+        else {
+            continue;
+        };
+        if let Some(term_ty) = proj.term.as_type() {
+            sig_output.insert(param_ty.index as usize, term_ty);
+        }
+    }
+    for (idx, inputs) in sig_inputs {
+        let rustc_middle::ty::TyKind::Tuple(input_tys) = inputs.kind() else { continue };
+        let output = sig_output.get(&idx).copied().unwrap_or(tcx.types.unit);
+        // v1: fully concrete signatures only.
+        use rustc_middle::ty::TypeVisitableExt;
+        if inputs.has_param() || output.has_param() {
+            continue;
+        }
+        let arity = input_tys.len();
+        if arity > 3 {
+            continue;
+        }
+        let Some(model) = nondet_fns[arity] else { continue };
+        // nondet_fnN<A.., R>: generic args are the inputs followed by the return type.
+        let mut args: Vec<GenericArgKind> =
+            input_tys.iter().map(|t| GenericArgKind::Type(rustc_internal::stable(t))).collect();
+        args.push(GenericArgKind::Type(rustc_internal::stable(output)));
+        let Ok(inst) = Instance::resolve(model, &GenericArgs(args)) else { continue };
+        // The function item TYPE of the resolved instance.
+        out.entry(idx).or_default().push(inst.ty());
+    }
+    out
+}
+
+/// For type parameters bound by `Iterator` (with a concrete, vec-generation-qualifying
+/// `Item = T` projection), derive the candidate `std::vec::IntoIter<T>`: the return type of
+/// the `AnyVecIntoIter` model, whose generated argument iterates an unbounded
+/// nondeterministic vector.
+fn iterator_bound_candidates(
+    tcx: TyCtxt,
+    def: FnDef,
+    vec_into_iter: Option<FnDef>,
+) -> FxHashMap<usize, Vec<Ty>> {
+    let mut out: FxHashMap<usize, Vec<Ty>> = FxHashMap::default();
+    let Some(model) = vec_into_iter else { return out };
+    let Some(iterator_trait) = tcx.lang_items().iterator_trait() else { return out };
+    let def_id = rustc_internal::internal(tcx, def.def_id());
+    // Param indices bound by Iterator.
+    let mut iter_params: Vec<usize> = vec![];
+    for (predicate, _span) in tcx.predicates_of(def_id).predicates {
+        let Some(tp) = predicate.as_trait_clause() else { continue };
+        let tp = tp.skip_binder();
+        if tp.def_id() != iterator_trait {
+            continue;
+        }
+        if let rustc_middle::ty::TyKind::Param(param_ty) = tp.self_ty().kind() {
+            iter_params.push(param_ty.index as usize);
+        }
+    }
+    if iter_params.is_empty() {
+        return out;
+    }
+    // Item = T projections for those params.
+    for (predicate, _span) in tcx.predicates_of(def_id).predicates {
+        let Some(proj) = predicate.as_projection_clause() else { continue };
+        let proj = proj.skip_binder();
+        let rustc_middle::ty::TyKind::Param(param_ty) = proj.projection_term.self_ty().kind()
+        else {
+            continue;
+        };
+        let idx = param_ty.index as usize;
+        if !iter_params.contains(&idx) {
+            continue;
+        }
+        let Some(item_ty) = proj.term.as_type() else { continue };
+        use rustc_middle::ty::TypeVisitableExt;
+        if item_ty.has_param() {
+            continue;
+        }
+        let item_stable = rustc_internal::stable(item_ty);
+        // The model's storage is an unbounded Vec, so the element must qualify.
+        if !crate::kani_middle::slice_elem_unbounded_ok(tcx, item_stable) {
+            continue;
+        }
+        let Ok(inst) =
+            Instance::resolve(model, &GenericArgs(vec![GenericArgKind::Type(item_stable)]))
+        else {
+            continue;
+        };
+        // Candidate = the model's return type (std::vec::IntoIter<T>).
+        let Some(sig) = inst.ty().kind().fn_sig() else { continue };
+        out.entry(idx).or_default().push(sig.skip_binder().output());
+    }
+    out
+}
+
+fn choose_generic_instantiation(
+    tcx: TyCtxt,
+    fn_item: CrateItem,
+    nondet_fns: &[Option<FnDef>; 4],
+    vec_into_iter: Option<FnDef>,
+) -> Result<Instance, String> {
     let TyKind::RigidTy(RigidTy::FnDef(def, identity_args)) = fn_item.ty().kind() else {
         return Err("not a function definition".to_string());
     };
@@ -539,6 +689,8 @@ fn choose_generic_instantiation(tcx: TyCtxt, fn_item: CrateItem) -> Result<Insta
     // for each: the shared primitive candidates, plus types derived from the parameter's own
     // trait bounds (concrete implementors of the traits it must satisfy).
     let impl_derived = impl_derived_candidates(tcx, def);
+    let fn_bound = fn_bound_candidates(tcx, def, nondet_fns);
+    let iter_bound = iterator_bound_candidates(tcx, def, vec_into_iter);
     let type_slots: Vec<usize> = identity_args
         .0
         .iter()
@@ -553,6 +705,18 @@ fn choose_generic_instantiation(tcx: TyCtxt, fn_item: CrateItem) -> Result<Insta
                 if !cands.contains(ty) {
                     cands.push(*ty);
                 }
+            }
+            // Fn-bound parameters: try the nondeterministic function items FIRST — no
+            // primitive can satisfy an Fn bound, so they would only waste solver queries.
+            if let Some(fnc) = fn_bound.get(&idx) {
+                let mut new = fnc.clone();
+                new.extend(cands);
+                cands = new;
+            }
+            if let Some(itc) = iter_bound.get(&idx) {
+                let mut new = itc.clone();
+                new.extend(cands);
+                cands = new;
             }
             cands
         })
@@ -659,6 +823,8 @@ fn automatic_harness_partition(
     kani_any_def: FnDef,
     kani_bounded_any_def: FnDef,
     kani_assert_def: FnDef,
+    nondet_fns: [Option<FnDef>; 4],
+    vec_into_iter: Option<FnDef>,
     unbounded_slice_available: bool,
     smart_pointer_models: SmartPointerModels,
 ) -> (Vec<(Instance, bool, bool)>, BTreeMap<String, AutoHarnessSkipReason>) {
@@ -811,7 +977,7 @@ fn automatic_harness_partition(
         // and its name (e.g. `foo::<i32>`) reflects that.
         let instance = match Instance::try_from(func) {
             Ok(instance) => instance,
-            Err(_) => match choose_generic_instantiation(tcx, func) {
+            Err(_) => match choose_generic_instantiation(tcx, func, &nondet_fns, vec_into_iter) {
                 Ok(instance) => instance,
                 Err(detail) => {
                     skipped.insert(

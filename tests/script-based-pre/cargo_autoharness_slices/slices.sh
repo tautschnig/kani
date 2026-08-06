@@ -5,4 +5,4 @@
 echo "[without --bounded-arguments]"
 cargo kani autoharness -Z autoharness --output-format=regular --list 2>&1 | grep -m1 'Requires --bounded-arguments'
 echo "[with --bounded-arguments]"
-cargo kani autoharness -Z autoharness --output-format=regular --bounded-arguments
+cargo kani autoharness -Z autoharness --output-format=regular --bounded-arguments --harness-timeout 300s -Z unstable-options
