@@ -119,6 +119,7 @@ impl CodegenUnits {
                         kani_fns.get(&KaniModel::NondetFn3.into()).copied(),
                     ],
                     kani_fns.get(&KaniModel::AnyVecIntoIter.into()).copied(),
+                    kani_fns.get(&KaniModel::AnyVecUnbounded.into()).copied(),
                     kani_fns.contains_key(&KaniModel::AnySliceRefUnbounded.into()),
                     SmartPointerModels::from_kani_functions(kani_fns),
                 );
@@ -535,13 +536,23 @@ fn args_satisfy_predicates(tcx: TyCtxt, def: FnDef, args: &GenericArgs) -> bool 
 /// Signature types that themselves mention generic parameters are only usable if those
 /// parameters appear EARLIER in the parameter list (they are substituted with the current
 /// choice by the caller); v1 keeps it simple and only admits fully concrete signatures.
-fn fn_bound_candidates(
-    tcx: TyCtxt,
+/// An Fn-bound signature that references other generic parameters (e.g. `F: Fn(T) -> T`):
+/// its concrete form depends on the instantiation chosen for those parameters, so the
+/// candidate fn-item type is constructed per candidate choice
+/// (c.f. [resolve_deferred_fn_slots]).
+struct DeferredFnSpec<'tcx> {
+    inputs: rustc_middle::ty::Ty<'tcx>,
+    output: rustc_middle::ty::Ty<'tcx>,
+}
+
+fn fn_bound_candidates<'tcx>(
+    tcx: TyCtxt<'tcx>,
     def: FnDef,
     nondet_fns: &[Option<FnDef>; 4],
-) -> FxHashMap<usize, Vec<Ty>> {
+) -> (FxHashMap<usize, Vec<Ty>>, FxHashMap<usize, DeferredFnSpec<'tcx>>) {
     let def_id = rustc_internal::internal(tcx, def.def_id());
     let mut out: FxHashMap<usize, Vec<Ty>> = FxHashMap::default();
+    let mut deferred: FxHashMap<usize, DeferredFnSpec<'tcx>> = FxHashMap::default();
     let fn_once = tcx.lang_items().fn_once_trait();
     let fn_mut = tcx.lang_items().fn_mut_trait();
     let fn_tr = tcx.lang_items().fn_trait();
@@ -562,7 +573,7 @@ fn fn_bound_candidates(
         sig_inputs.insert(param_ty.index as usize, inputs);
     }
     if sig_inputs.is_empty() {
-        return out;
+        return (out, deferred);
     }
     // The return type comes from the FnOnce::Output projection bound.
     let mut sig_output: FxHashMap<usize, rustc_middle::ty::Ty> = FxHashMap::default();
@@ -580,16 +591,20 @@ fn fn_bound_candidates(
     for (idx, inputs) in sig_inputs {
         let rustc_middle::ty::TyKind::Tuple(input_tys) = inputs.kind() else { continue };
         let output = sig_output.get(&idx).copied().unwrap_or(tcx.types.unit);
-        // v1: fully concrete signatures only.
         use rustc_middle::ty::TypeVisitableExt;
-        if inputs.has_param() || output.has_param() {
-            continue;
-        }
         let arity = input_tys.len();
         if arity > 3 {
             continue;
         }
         let Some(model) = nondet_fns[arity] else { continue };
+        if inputs.has_param() || output.has_param() {
+            // Signature references other generic parameters: defer construction until a
+            // candidate choice for those parameters is made.
+            // SAFETY of the transmute-free 'static: predicates_of types live for the whole
+            // compilation session ('tcx); we only use them within this query's lifetime.
+            deferred.insert(idx, DeferredFnSpec { inputs, output });
+            continue;
+        }
         // nondet_fnN<A.., R>: generic args are the inputs followed by the return type.
         let mut args: Vec<GenericArgKind> =
             input_tys.iter().map(|t| GenericArgKind::Type(rustc_internal::stable(t))).collect();
@@ -598,7 +613,69 @@ fn fn_bound_candidates(
         // The function item TYPE of the resolved instance.
         out.entry(idx).or_default().push(inst.ty());
     }
-    out
+    (out, deferred)
+}
+
+/// Resolve deferred Fn-bound slots for a concrete candidate `choice`: substitute the
+/// chosen types into the deferred signature, construct the matching-arity nondet_fn item
+/// type, and overwrite the placeholder in `choice`. Returns false if any deferred slot
+/// cannot be resolved for this choice (skip it).
+#[allow(clippy::too_many_arguments)]
+fn resolve_deferred_fn_slots<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    identity_args: &GenericArgs,
+    type_slots: &[usize],
+    choice: &mut [Ty],
+    deferred: &FxHashMap<usize, DeferredFnSpec<'tcx>>,
+    nondet_fns: &[Option<FnDef>; 4],
+) -> bool {
+    if deferred.is_empty() {
+        return true;
+    }
+    // Build a full internal substitution from the current choice (placeholders included:
+    // deferred slots hold unit, which is fine as long as no deferred signature references
+    // another Fn-bound parameter).
+    let mut next_type = 0usize;
+    let stable_args = GenericArgs(
+        identity_args
+            .0
+            .iter()
+            .map(|arg| match arg {
+                GenericArgKind::Type(_) => {
+                    let t = choice[next_type];
+                    next_type += 1;
+                    GenericArgKind::Type(t)
+                }
+                GenericArgKind::Lifetime(_) => {
+                    GenericArgKind::Lifetime(Region { kind: RegionKind::ReErased })
+                }
+                GenericArgKind::Const(_) => GenericArgKind::Const(
+                    TyConst::try_from_target_usize(AUTOHARNESS_CONST_GENERIC_VALUE).unwrap(),
+                ),
+            })
+            .collect(),
+    );
+    let args_internal = rustc_internal::internal(tcx, &stable_args);
+    for (&idx, spec) in deferred {
+        use rustc_middle::ty::TypeVisitableExt;
+        let inputs =
+            rustc_middle::ty::EarlyBinder::bind(spec.inputs).instantiate(tcx, args_internal);
+        let output =
+            rustc_middle::ty::EarlyBinder::bind(spec.output).instantiate(tcx, args_internal);
+        if inputs.has_param() || output.has_param() {
+            return false;
+        }
+        let rustc_middle::ty::TyKind::Tuple(input_tys) = inputs.kind() else { return false };
+        let arity = input_tys.len();
+        let Some(model) = nondet_fns.get(arity).copied().flatten() else { return false };
+        let mut margs: Vec<GenericArgKind> =
+            input_tys.iter().map(|t| GenericArgKind::Type(rustc_internal::stable(t))).collect();
+        margs.push(GenericArgKind::Type(rustc_internal::stable(output)));
+        let Ok(inst) = Instance::resolve(model, &GenericArgs(margs)) else { return false };
+        let Some(pos) = type_slots.iter().position(|&s| s == idx) else { return false };
+        choice[pos] = inst.ty();
+    }
+    true
 }
 
 /// For type parameters bound by `Iterator` (with a concrete, vec-generation-qualifying
@@ -609,24 +686,29 @@ fn iterator_bound_candidates(
     tcx: TyCtxt,
     def: FnDef,
     vec_into_iter: Option<FnDef>,
+    vec_unbounded: Option<FnDef>,
 ) -> FxHashMap<usize, Vec<Ty>> {
     let mut out: FxHashMap<usize, Vec<Ty>> = FxHashMap::default();
     let Some(model) = vec_into_iter else { return out };
     let Some(iterator_trait) = tcx.lang_items().iterator_trait() else { return out };
+    let into_iterator_trait = tcx.get_diagnostic_item(rustc_span::sym::IntoIterator);
     let def_id = rustc_internal::internal(tcx, def.def_id());
-    // Param indices bound by Iterator.
+    // Param indices bound by Iterator (instantiated with std::vec::IntoIter<T>) or
+    // IntoIterator (instantiated with Vec<T> itself, which implements it and whose
+    // generation already exists).
     let mut iter_params: Vec<usize> = vec![];
+    let mut into_iter_params: Vec<usize> = vec![];
     for (predicate, _span) in tcx.predicates_of(def_id).predicates {
         let Some(tp) = predicate.as_trait_clause() else { continue };
         let tp = tp.skip_binder();
-        if tp.def_id() != iterator_trait {
-            continue;
-        }
-        if let rustc_middle::ty::TyKind::Param(param_ty) = tp.self_ty().kind() {
+        let rustc_middle::ty::TyKind::Param(param_ty) = tp.self_ty().kind() else { continue };
+        if tp.def_id() == iterator_trait {
             iter_params.push(param_ty.index as usize);
+        } else if Some(tp.def_id()) == into_iterator_trait {
+            into_iter_params.push(param_ty.index as usize);
         }
     }
-    if iter_params.is_empty() {
+    if iter_params.is_empty() && into_iter_params.is_empty() {
         return out;
     }
     // Item = T projections for those params.
@@ -638,7 +720,9 @@ fn iterator_bound_candidates(
             continue;
         };
         let idx = param_ty.index as usize;
-        if !iter_params.contains(&idx) {
+        let is_iter = iter_params.contains(&idx);
+        let is_into = into_iter_params.contains(&idx);
+        if !is_iter && !is_into {
             continue;
         }
         let Some(item_ty) = proj.term.as_type() else { continue };
@@ -656,9 +740,27 @@ fn iterator_bound_candidates(
         else {
             continue;
         };
-        // Candidate = the model's return type (std::vec::IntoIter<T>).
         let Some(sig) = inst.ty().kind().fn_sig() else { continue };
-        out.entry(idx).or_default().push(sig.skip_binder().output());
+        let into_iter_ty = sig.skip_binder().output();
+        if is_iter {
+            // Candidate = the model's return type (std::vec::IntoIter<T>).
+            out.entry(idx).or_default().push(into_iter_ty);
+        }
+        if is_into {
+            // Candidate = Vec<T>: strip IntoIter back to its Vec (same generic args). The
+            // simplest robust construction is via the AnyVecUnbounded-independent route:
+            // IntoIterator's Item projection is defined for Vec<T>, and generation for
+            // Vec<T> already exists; construct the Vec type from the item type.
+            if let Some(vec_model) = vec_unbounded
+                && let Ok(vinst) = Instance::resolve(
+                    vec_model,
+                    &GenericArgs(vec![GenericArgKind::Type(item_stable)]),
+                )
+                && let Some(vsig) = vinst.ty().kind().fn_sig()
+            {
+                out.entry(idx).or_default().push(vsig.skip_binder().output());
+            }
+        }
     }
     out
 }
@@ -668,6 +770,7 @@ fn choose_generic_instantiation(
     fn_item: CrateItem,
     nondet_fns: &[Option<FnDef>; 4],
     vec_into_iter: Option<FnDef>,
+    vec_unbounded: Option<FnDef>,
 ) -> Result<Instance, String> {
     let TyKind::RigidTy(RigidTy::FnDef(def, identity_args)) = fn_item.ty().kind() else {
         return Err("not a function definition".to_string());
@@ -689,8 +792,8 @@ fn choose_generic_instantiation(
     // for each: the shared primitive candidates, plus types derived from the parameter's own
     // trait bounds (concrete implementors of the traits it must satisfy).
     let impl_derived = impl_derived_candidates(tcx, def);
-    let fn_bound = fn_bound_candidates(tcx, def, nondet_fns);
-    let iter_bound = iterator_bound_candidates(tcx, def, vec_into_iter);
+    let (fn_bound, deferred_fn) = fn_bound_candidates(tcx, def, nondet_fns);
+    let iter_bound = iterator_bound_candidates(tcx, def, vec_into_iter, vec_unbounded);
     let type_slots: Vec<usize> = identity_args
         .0
         .iter()
@@ -717,6 +820,11 @@ fn choose_generic_instantiation(
                 let mut new = itc.clone();
                 new.extend(cands);
                 cands = new;
+            }
+            // Deferred Fn-bound slots get a single placeholder (resolved per choice by
+            // resolve_deferred_fn_slots); other candidates would be wasted solver queries.
+            if deferred_fn.contains_key(&idx) {
+                cands = vec![Ty::new_tuple(&[])];
             }
             cands
         })
@@ -773,12 +881,20 @@ fn choose_generic_instantiation(
     if !type_slots.is_empty() {
         let mut odometer = vec![0usize; type_slots.len()];
         'product: loop {
-            let choice: Vec<Ty> =
+            let mut choice: Vec<Ty> =
                 odometer.iter().enumerate().map(|(i, &c)| slot_candidates[i][c]).collect();
+            let deferred_ok = resolve_deferred_fn_slots(
+                tcx,
+                &identity_args,
+                &type_slots,
+                &mut choice,
+                &deferred_fn,
+                nondet_fns,
+            );
             // Skip choices already tried in the uniform pass.
             let uniform = choice.iter().all(|ty| *ty == choice[0])
                 && generic_instantiation_candidates().contains(&choice[0]);
-            if !uniform {
+            if !uniform && deferred_ok {
                 if let Some(instance) = try_choice(&choice) {
                     return Ok(instance);
                 }
@@ -825,6 +941,7 @@ fn automatic_harness_partition(
     kani_assert_def: FnDef,
     nondet_fns: [Option<FnDef>; 4],
     vec_into_iter: Option<FnDef>,
+    vec_unbounded: Option<FnDef>,
     unbounded_slice_available: bool,
     smart_pointer_models: SmartPointerModels,
 ) -> (Vec<(Instance, bool, bool)>, BTreeMap<String, AutoHarnessSkipReason>) {
@@ -977,7 +1094,13 @@ fn automatic_harness_partition(
         // and its name (e.g. `foo::<i32>`) reflects that.
         let instance = match Instance::try_from(func) {
             Ok(instance) => instance,
-            Err(_) => match choose_generic_instantiation(tcx, func, &nondet_fns, vec_into_iter) {
+            Err(_) => match choose_generic_instantiation(
+                tcx,
+                func,
+                &nondet_fns,
+                vec_into_iter,
+                vec_unbounded,
+            ) {
                 Ok(instance) => instance,
                 Err(detail) => {
                     skipped.insert(

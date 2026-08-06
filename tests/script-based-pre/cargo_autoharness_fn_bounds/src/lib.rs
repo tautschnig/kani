@@ -35,9 +35,15 @@ pub fn branches<F: Fn(u8) -> bool>(f: F, x: u8) {
     }
 }
 
-// TEST NOTE: still skipped: signature mentions another generic parameter (v1 limitation).
+// TEST NOTE: harnessed as apply_generic::<i32, nondet_fn1<i32, i32>>: the closure
+// signature references another generic parameter, resolved per candidate choice.
 pub fn apply_generic<T, F: Fn(T) -> T>(f: F, x: T) -> T {
     f(x)
+}
+
+// TEST NOTE: IntoIterator bound: instantiated with Vec<u16>; PASSES (loop-free).
+pub fn first_of<I: IntoIterator<Item = u16>>(it: I) -> Option<u16> {
+    it.into_iter().next()
 }
 
 // Iterator-bounded generic functions: instantiated with std::vec::IntoIter<T> over an
