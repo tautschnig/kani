@@ -22,7 +22,8 @@ pub fn first(xs: &[u8]) -> u8 {
     xs[0]
 }
 
-// TEST NOTE: should PASS: writing through a mutable slice.
+// TEST NOTE: should FAIL with an unwinding assertion: mutable slices are also unbounded
+// now, so the zeroing loop cannot be fully unwound — signaled, not silently bounded.
 pub fn zero_all(xs: &mut [u8]) {
     for x in xs.iter_mut() {
         *x = 0;
