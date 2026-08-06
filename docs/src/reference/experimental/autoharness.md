@@ -87,6 +87,24 @@ using the `--jobs` option with the thread pool's default number of threads and
 `--output-format=regular` to verify harnesses sequentially with Kani's default, more detailed
 output.
 
+### Mined type invariants
+
+Under `--constructor-args`, Kani additionally *mines* type invariants from a type's own
+assertions: conditions over `self`'s fields (including through simple accessor methods, and
+per-variant for enums matched on `self`) that are asserted on every normal return path of at
+least **two** distinct methods are treated as invariants of the type, and assumed for
+generated values. This covers types with no viable constructor and complements
+constructor-based generation. Like it, mining is heuristic (an assert might not be a true
+invariant), hence gated behind the same opt-in flag and "(ctor)" marker.
+
+With the additional `--check-invariants` option, mined invariants are also *checked* on the
+values that verified functions return (including through `&T`, `Option<T>` and `Result<T,
+E>` — `None`/`Err` returns pass vacuously). Failures appear as a distinct property class
+("mined invariant of `T` violated by return value", naming the methods that assert the
+condition), turning autoharness into an automatic invariant-preservation checker. Because
+the mined predicate is heuristic, such a failure means the returned value would trip the
+type's own assertions when used — which may or may not be a bug in the returning function.
+
 ### Constructor-based generation (--constructor-args)
 
 By default, when a type does not implement `Arbitrary`, Kani synthesizes values field by field.
@@ -103,15 +121,17 @@ way are marked "(ctor)" in the output, and their verification results only cover
 reachable through the chosen constructor; a bug that requires a different value will not be
 found.
 
-### Unbounded slice arguments
+### Unbounded slice, mutable slice and Vec arguments
 
-Immutable slice arguments (`&[T]`) whose element type is an integer, float, `bool`, or a
-byte-width ranged type are generated *unbounded*: a fresh allocation of nondeterministic
-size, with element validity established by a quantified assumption. Verification results for
-such harnesses hold for **all** slice lengths. If the function iterates over the slice and
-the loop cannot be fully unwound within the unwinding bound, the harness fails with an
-unwinding assertion: the incompleteness is signaled, not silent. Other element types,
-mutable slices, and `&str` use bounded generation (below).
+Slice arguments (`&[T]` and `&mut [T]`) and `Vec<T>` arguments whose element type is a
+primitive integer or float are generated *unbounded*: a fresh allocation of nondeterministic
+size (exclusive by construction for `&mut [T]`; owned and freed on drop for `Vec<T>`).
+Verification results for such harnesses hold for **all** lengths. If the function iterates
+over the data and the loop cannot be fully unwound within the unwinding bound, the harness
+fails with an unwinding assertion: the incompleteness is signaled, not silent. Other element
+types and `&str` use bounded generation (below); element types with validity constraints
+(e.g. `bool`, `NonZero*`) currently also use the bounded path, pending solver support for
+quantified validity assumptions.
 
 ## Example
 Using the `estimate_size` example from [First Steps](../../tutorial-first-steps.md) again:
