@@ -862,6 +862,15 @@ fn check_mined_invariants(
     conjuncts: &[MinedConjunct],
 ) {
     let assert_inst = Instance::resolve(kani_assert, &GenericArgs(vec![])).unwrap();
+    // Measurement hook: the check surface (how many return sites carry mined-invariant
+    // checks, for which types) is needed to interpret corpus-sweep results -- zero
+    // violations is only meaningful relative to the number of checks that ran. Kani runs
+    // the compiler at log-level=warn, so this is visible in sweep logs.
+    tracing::warn!(
+        "autoharness: emitting {} mined-invariant check(s) on a return value of type `{}`",
+        conjuncts.len(),
+        ty
+    );
     // Compute the wrapper guard (discriminant != ok) once.
     let wrapper_ne: Option<Local> = wrapper.and_then(|(wlcl, ok_idx, wty)| {
         let span = source.span(body.blocks());
