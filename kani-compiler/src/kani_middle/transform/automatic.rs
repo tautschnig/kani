@@ -1069,6 +1069,47 @@ fn call_kani_any_for_ty(
         );
         return lcl;
     }
+    // Anonymous tuples: generate each element recursively and aggregate. Reached both for
+    // top-level tuple arguments and for tuple-typed fields during derive-style ADT
+    // synthesis (e.g. enum variants holding `(&[u8], i32)`).
+    if let TyKind::RigidTy(RigidTy::Tuple(elem_tys)) = ty.kind() {
+        let elem_locals: Vec<Local> = elem_tys
+            .iter()
+            .map(|elem_ty| {
+                call_kani_any_for_ty(
+                    tcx,
+                    kani_any,
+                    kani_assume,
+                    kani_assert,
+                    constructor_args,
+                    mined_cache,
+                    kani_any_ptr,
+                    kani_any_slice_ref,
+                    kani_any_slice_ref_unbounded,
+                    kani_any_slice_mut_unbounded,
+                    kani_any_vec_unbounded,
+                    kani_any_vec_into_iter,
+                    kani_any_str_ref,
+                    kani_bounded_any,
+                    kani_assume_safe,
+                    smart_pointer_models,
+                    body,
+                    *elem_ty,
+                    Mutability::Not,
+                    source,
+                    invariant_cache,
+                )
+            })
+            .collect();
+        let span = source.span(body.blocks());
+        let lcl = body.new_local(ty, span, mutability);
+        let rvalue = Rvalue::Aggregate(
+            AggregateKind::Tuple,
+            elem_locals.into_iter().map(|l| Operand::Move(l.into())).collect(),
+        );
+        body.assign_to(Place::from(lcl), rvalue, source, InsertPosition::Before);
+        return lcl;
+    }
     if let TyKind::RigidTy(RigidTy::Ref(region, inner_ty, inner_mutability)) = ty.kind()
         && matches!(
             inner_ty.kind(),
@@ -1443,6 +1484,10 @@ impl AutomaticArbitraryPass {
     ) -> BasicBlockIdx {
         let fields = variant.fields();
         let mut field_locals = vec![];
+        // Field generation may insert a variable number of basic blocks per field (zero for
+        // ZST function items, several for nested tuples), so record where we started
+        // instead of assuming one block per field.
+        let start_bb = source.bb();
 
         // Construct nondeterministic values for each of the variant's fields
         for ty in fields.iter().map(|field| field.ty_with_args(adt_args)) {
@@ -1485,8 +1530,8 @@ impl AutomaticArbitraryPass {
         );
         body.assign_to(Place::from(0), rvalue, &mut assign_instr, InsertPosition::Before);
 
-        // The index of the first block we inserted is (last bb index - number of bbs we inserted above it)
-        source.bb() - (fields.len() + 1)
+        // The first block we inserted is where the source cursor stood when we began.
+        start_bb
     }
 
     /// Overwrite the default kani::any() implementation `body` for the enum described by `def`.

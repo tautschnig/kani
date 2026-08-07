@@ -644,6 +644,25 @@ pub enum CtorReturn {
 /// the nondeterministic arguments down to exactly the values the crate considers valid.
 /// Visibility is irrelevant (the body is inlined, not called). Prefers more arguments over
 /// fewer; ties broken by definition order.
+/// Extend `adt_args` with an erased lifetime for each of the associated item's own
+/// early-bound lifetime parameters (its type/const params are rejected by the callers'
+/// filters), so `Instance::resolve` sees a complete argument list.
+fn ctor_args_with_lifetimes(
+    tcx: TyCtxt,
+    item: rustc_span::def_id::DefId,
+    adt_args: &GenericArgs,
+) -> GenericArgs {
+    let mut args = adt_args.0.clone();
+    for p in &tcx.generics_of(item).own_params {
+        if matches!(p.kind, rustc_middle::ty::GenericParamDefKind::Lifetime) {
+            args.push(GenericArgKind::Lifetime(rustc_public::ty::Region {
+                kind: rustc_public::ty::RegionKind::ReErased,
+            }));
+        }
+    }
+    GenericArgs(args)
+}
+
 pub fn find_unchecked_constructor(
     tcx: TyCtxt,
     ty: Ty,
@@ -672,8 +691,11 @@ pub fn find_unchecked_constructor(
             // For generic ADTs (e.g. deranged's RangedI32<MIN, MAX>), instantiate the
             // constructor with the ADT's own generic arguments: for inherent impls whose
             // parameters mirror the type's, this is the correct substitution; when it is
-            // not, resolution fails and the constructor is skipped.
-            let Ok(instance) = Instance::resolve(ctor_def, adt_args) else {
+            // not, resolution fails and the constructor is skipped. The item's own
+            // early-bound lifetimes (e.g. AtomicU8::from_ptr<'a>) must be supplied too --
+            // erased -- or instantiation panics on the arity mismatch.
+            let ctor_args = ctor_args_with_lifetimes(tcx, item, adt_args);
+            let Ok(instance) = Instance::resolve(ctor_def, &ctor_args) else {
                 continue;
             };
             if !instance.has_body() {
@@ -803,7 +825,8 @@ pub fn find_arbitrary_constructor(
             {
                 continue;
             }
-            let Ok(instance) = Instance::resolve(ctor_def, &GenericArgs(vec![])) else {
+            let ctor_args = ctor_args_with_lifetimes(tcx, item, &GenericArgs(vec![]));
+            let Ok(instance) = Instance::resolve(ctor_def, &ctor_args) else {
                 continue;
             };
             if !instance.has_body() {
@@ -1080,6 +1103,27 @@ fn autoharness_supported_arg_ty(
     // are zero-sized and generated as constants: ordinary support.
     if matches!(ty.kind(), TyKind::RigidTy(RigidTy::FnDef(..))) {
         return ArgSupport::Arbitrary;
+    }
+    // Anonymous tuples: supported iff every element is (generation recurses elementwise
+    // and aggregates; c.f. the tuple arm in `call_kani_any_for_ty`).
+    if let TyKind::RigidTy(RigidTy::Tuple(elem_tys)) = ty.kind() {
+        let mut worst = ArgSupport::Arbitrary;
+        for elem_ty in elem_tys {
+            match autoharness_supported_arg_ty(
+                tcx,
+                elem_ty,
+                kani_any_def,
+                kani_bounded_any_def,
+                unbounded_slice_available,
+                smart_pointer_models,
+                ty_arbitrary_cache,
+            ) {
+                ArgSupport::Unsupported => return ArgSupport::Unsupported,
+                ArgSupport::Bounded => worst = ArgSupport::Bounded,
+                _ => {}
+            }
+        }
+        return worst;
     }
     if let TyKind::RigidTy(RigidTy::RawPtr(inner_ty, _)) = ty.kind() {
         // Raw pointers (of any nesting depth) are supported as long as the base pointee

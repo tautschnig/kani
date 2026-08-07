@@ -58,3 +58,46 @@ pub fn sum_iter<I: Iterator<Item = u8>>(it: I) -> u64 {
 pub fn first_item<I: Iterator<Item = u32>>(mut it: I) -> Option<u32> {
     it.next()
 }
+
+// TEST NOTE (regression, tap ICE): HRTB closure bound (for<'a> via &Self sugar);
+// previously leaked escaping bound vars into the trait solver.
+pub fn inspect_with<F: FnOnce(&u32)>(f: F, v: u32) {
+    f(&v);
+}
+
+// TEST NOTE (regression, nom ICE): enum variant holding an anonymous tuple field;
+// previously the derive-style generator had no tuple vocabulary.
+pub enum Packet {
+    Pair((u8, u16)),
+    Empty,
+}
+pub fn packet_size(p: Packet) -> usize {
+    match p {
+        Packet::Pair((a, _)) => a as usize,
+        Packet::Empty => 0,
+    }
+}
+
+// TEST NOTE: top-level anonymous tuple argument, generated elementwise.
+pub fn tuple_arg(t: (u8, bool)) -> u8 {
+    if t.1 { t.0 } else { 0 }
+}
+
+// TEST NOTE (regression, brotli ICE): constructor with its own early-bound lifetime
+// must not break ctor discovery for the type (from_ref is skipped, new is used).
+pub struct Gauge {
+    level: u8,
+}
+impl Gauge {
+    pub fn new(level: u8) -> Self {
+        Gauge { level: level.min(100) }
+    }
+    pub fn from_ref<'a>(r: &'a u8) -> Self {
+        Gauge::new(*r)
+    }
+    pub fn headroom(&self) -> u8 {
+        // Only reachable underflow-free through new(); the derive path may produce raw
+        // levels, so saturate.
+        100_u8.saturating_sub(self.level)
+    }
+}

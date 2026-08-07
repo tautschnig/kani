@@ -560,7 +560,10 @@ fn fn_bound_candidates<'tcx>(
     let mut sig_inputs: FxHashMap<usize, rustc_middle::ty::Ty> = FxHashMap::default();
     for (predicate, _span) in tcx.predicates_of(def_id).predicates {
         let Some(tp) = predicate.as_trait_clause() else { continue };
-        let tp = tp.skip_binder();
+        // HRTB bounds (e.g. for<'a> FnOnce(&'a Self)) carry late-bound regions; erase them
+        // rather than skipping the binder, which would leak escaping bound vars into the
+        // trait solver (ICE: !self_ty.has_escaping_bound_vars()).
+        let tp = tcx.instantiate_bound_regions_with_erased(tp);
         let tid = Some(tp.def_id());
         if tid != fn_once && tid != fn_mut && tid != fn_tr {
             continue;
@@ -579,7 +582,7 @@ fn fn_bound_candidates<'tcx>(
     let mut sig_output: FxHashMap<usize, rustc_middle::ty::Ty> = FxHashMap::default();
     for (predicate, _span) in tcx.predicates_of(def_id).predicates {
         let Some(proj) = predicate.as_projection_clause() else { continue };
-        let proj = proj.skip_binder();
+        let proj = tcx.instantiate_bound_regions_with_erased(proj);
         let rustc_middle::ty::TyKind::Param(param_ty) = proj.projection_term.self_ty().kind()
         else {
             continue;
@@ -665,6 +668,16 @@ fn resolve_deferred_fn_slots<'tcx>(
         if inputs.has_param() || output.has_param() {
             return false;
         }
+        // The substitution may produce unnormalizable projections (e.g. <i32 as Tap>::Val
+        // for a choice that does not satisfy the bound); normalize here and skip the
+        // choice on failure, rather than letting Instance::resolve ICE on it.
+        let typing_env = rustc_middle::ty::TypingEnv::fully_monomorphized();
+        let Ok(inputs) = tcx.try_normalize_erasing_regions(typing_env, inputs) else {
+            return false;
+        };
+        let Ok(output) = tcx.try_normalize_erasing_regions(typing_env, output) else {
+            return false;
+        };
         let rustc_middle::ty::TyKind::Tuple(input_tys) = inputs.kind() else { return false };
         let arity = input_tys.len();
         let Some(model) = nondet_fns.get(arity).copied().flatten() else { return false };
@@ -700,7 +713,7 @@ fn iterator_bound_candidates(
     let mut into_iter_params: Vec<usize> = vec![];
     for (predicate, _span) in tcx.predicates_of(def_id).predicates {
         let Some(tp) = predicate.as_trait_clause() else { continue };
-        let tp = tp.skip_binder();
+        let tp = tcx.instantiate_bound_regions_with_erased(tp);
         let rustc_middle::ty::TyKind::Param(param_ty) = tp.self_ty().kind() else { continue };
         if tp.def_id() == iterator_trait {
             iter_params.push(param_ty.index as usize);
@@ -714,7 +727,7 @@ fn iterator_bound_candidates(
     // Item = T projections for those params.
     for (predicate, _span) in tcx.predicates_of(def_id).predicates {
         let Some(proj) = predicate.as_projection_clause() else { continue };
-        let proj = proj.skip_binder();
+        let proj = tcx.instantiate_bound_regions_with_erased(proj);
         let rustc_middle::ty::TyKind::Param(param_ty) = proj.projection_term.self_ty().kind()
         else {
             continue;
