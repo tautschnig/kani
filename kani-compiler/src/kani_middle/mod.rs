@@ -644,23 +644,48 @@ pub enum CtorReturn {
 /// the nondeterministic arguments down to exactly the values the crate considers valid.
 /// Visibility is irrelevant (the body is inlined, not called). Prefers more arguments over
 /// fewer; ties broken by definition order.
-/// Extend `adt_args` with an erased lifetime for each of the associated item's own
-/// early-bound lifetime parameters (its type/const params are rejected by the callers'
-/// filters), so `Instance::resolve` sees a complete argument list.
+/// Build a generic-argument list for the associated item that matches its full generics
+/// (impl parameters + own parameters) positionally: lifetimes (which may appear anywhere,
+/// e.g. first on lifetime-parameterized impls) get erased regions, and type/const slots
+/// are filled from `adt_args` in order. Returns None if `adt_args` does not fit the
+/// non-lifetime slots -- kind mismatches must be prevented up front because rustc's
+/// instantiation panics on them rather than returning an error.
 fn ctor_args_with_lifetimes(
     tcx: TyCtxt,
     item: rustc_span::def_id::DefId,
     adt_args: &GenericArgs,
-) -> GenericArgs {
-    let mut args = adt_args.0.clone();
-    for p in &tcx.generics_of(item).own_params {
-        if matches!(p.kind, rustc_middle::ty::GenericParamDefKind::Lifetime) {
-            args.push(GenericArgKind::Lifetime(rustc_public::ty::Region {
-                kind: rustc_public::ty::RegionKind::ReErased,
-            }));
+) -> Option<GenericArgs> {
+    // Collect the full parameter list: parent (impl) generics first, then the item's own.
+    let mut chain = vec![tcx.generics_of(item)];
+    while let Some(parent) = chain.last().unwrap().parent {
+        chain.push(tcx.generics_of(parent));
+    }
+    let mut supplied = adt_args.0.iter().filter(|a| !matches!(a, GenericArgKind::Lifetime(_)));
+    let mut args = vec![];
+    for g in chain.iter().rev() {
+        for p in &g.own_params {
+            match p.kind {
+                rustc_middle::ty::GenericParamDefKind::Lifetime => {
+                    args.push(GenericArgKind::Lifetime(rustc_public::ty::Region {
+                        kind: rustc_public::ty::RegionKind::ReErased,
+                    }));
+                }
+                rustc_middle::ty::GenericParamDefKind::Type { .. } => match supplied.next() {
+                    Some(a @ GenericArgKind::Type(_)) => args.push(a.clone()),
+                    _ => return None,
+                },
+                rustc_middle::ty::GenericParamDefKind::Const { .. } => match supplied.next() {
+                    Some(a @ GenericArgKind::Const(_)) => args.push(a.clone()),
+                    _ => return None,
+                },
+            }
         }
     }
-    GenericArgs(args)
+    // All supplied non-lifetime arguments must have been consumed.
+    if supplied.next().is_some() {
+        return None;
+    }
+    Some(GenericArgs(args))
 }
 
 pub fn find_unchecked_constructor(
@@ -694,7 +719,9 @@ pub fn find_unchecked_constructor(
             // not, resolution fails and the constructor is skipped. The item's own
             // early-bound lifetimes (e.g. AtomicU8::from_ptr<'a>) must be supplied too --
             // erased -- or instantiation panics on the arity mismatch.
-            let ctor_args = ctor_args_with_lifetimes(tcx, item, adt_args);
+            let Some(ctor_args) = ctor_args_with_lifetimes(tcx, item, adt_args) else {
+                continue;
+            };
             let Ok(instance) = Instance::resolve(ctor_def, &ctor_args) else {
                 continue;
             };
@@ -825,7 +852,9 @@ pub fn find_arbitrary_constructor(
             {
                 continue;
             }
-            let ctor_args = ctor_args_with_lifetimes(tcx, item, &GenericArgs(vec![]));
+            let Some(ctor_args) = ctor_args_with_lifetimes(tcx, item, &GenericArgs(vec![])) else {
+                continue;
+            };
             let Ok(instance) = Instance::resolve(ctor_def, &ctor_args) else {
                 continue;
             };
