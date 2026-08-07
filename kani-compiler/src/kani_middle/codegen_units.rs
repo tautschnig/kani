@@ -612,7 +612,14 @@ fn fn_bound_candidates<'tcx>(
         let mut args: Vec<GenericArgKind> =
             input_tys.iter().map(|t| GenericArgKind::Type(rustc_internal::stable(t))).collect();
         args.push(GenericArgKind::Type(rustc_internal::stable(output)));
-        let Ok(inst) = Instance::resolve(model, &GenericArgs(args)) else { continue };
+        let args = GenericArgs(args);
+        // Instance::resolve does not check trait bounds; the model requires R: Arbitrary
+        // (its body calls kani::any::<R>()), so verify the model's own predicates or the
+        // assert in harness generation fires (e.g. FnOnce() -> error::Error in syn).
+        if !args_satisfy_predicates(tcx, model, &args) {
+            continue;
+        }
+        let Ok(inst) = Instance::resolve(model, &args) else { continue };
         // The function item TYPE of the resolved instance.
         out.entry(idx).or_default().push(inst.ty());
     }
@@ -684,7 +691,12 @@ fn resolve_deferred_fn_slots<'tcx>(
         let mut margs: Vec<GenericArgKind> =
             input_tys.iter().map(|t| GenericArgKind::Type(rustc_internal::stable(t))).collect();
         margs.push(GenericArgKind::Type(rustc_internal::stable(output)));
-        let Ok(inst) = Instance::resolve(model, &GenericArgs(margs)) else { return false };
+        let margs = GenericArgs(margs);
+        // As in fn_bound_candidates: enforce the model's own R: Arbitrary bound.
+        if !args_satisfy_predicates(tcx, model, &margs) {
+            return false;
+        }
+        let Ok(inst) = Instance::resolve(model, &margs) else { return false };
         let Some(pos) = type_slots.iter().position(|&s| s == idx) else { return false };
         choice[pos] = inst.ty();
     }
