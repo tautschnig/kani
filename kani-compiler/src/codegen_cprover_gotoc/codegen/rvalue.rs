@@ -955,7 +955,19 @@ impl GotocCtx<'_, '_> {
     pub fn codegen_get_discriminant(&mut self, e: Expr, ty: Ty, res_ty: Ty) -> Expr {
         let layout = self.layout_of_stable(ty);
         match &layout.variants {
-            Variants::Empty => unreachable!("Discriminant for uninhabited enum with no variants"),
+            Variants::Empty => {
+                // No value of an uninhabited enum can exist, so this read is dynamically
+                // dead code: emit an assert(false)-guarded nondet instead of ICEing (the
+                // MIR can still contain the read, e.g. matches on a Result<_, !>-like
+                // enum in dependencies).
+                let goto_res_ty = self.codegen_ty_stable(res_ty);
+                self.codegen_unimplemented_expr(
+                    "discriminant of uninhabited enum",
+                    goto_res_ty,
+                    Location::none(),
+                    "https://github.com/model-checking/kani/issues/3832",
+                )
+            }
             Variants::Single { index } => {
                 let discr_val = layout
                     .ty

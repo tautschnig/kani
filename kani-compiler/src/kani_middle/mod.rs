@@ -688,6 +688,15 @@ fn ctor_args_with_lifetimes(
     Some(GenericArgs(args))
 }
 
+/// True if the (stable) type still carries escaping late-bound regions, e.g. an argument
+/// like `BorrowedFd<'_>` read from a skipped fn-sig binder. Such types must not reach
+/// trait-solver queries (rustc panics wrapping them in a dummy binder) and are not
+/// generatable anyway.
+fn has_escaping_bound_vars(tcx: TyCtxt, ty: Ty) -> bool {
+    use rustc_middle::ty::TypeVisitableExt;
+    rustc_internal::internal(tcx, ty).has_escaping_bound_vars()
+}
+
 pub fn find_unchecked_constructor(
     tcx: TyCtxt,
     ty: Ty,
@@ -743,10 +752,10 @@ pub fn find_unchecked_constructor(
                 continue;
             }
             if fn_sig.inputs().is_empty()
-                || !fn_sig
-                    .inputs()
-                    .iter()
-                    .all(|input| implements_arbitrary(*input, kani_any_def, ty_arbitrary_cache))
+                || !fn_sig.inputs().iter().all(|input| {
+                    !has_escaping_bound_vars(tcx, *input)
+                        && implements_arbitrary(*input, kani_any_def, ty_arbitrary_cache)
+                })
             {
                 continue;
             }
@@ -845,11 +854,10 @@ pub fn find_arbitrary_constructor(
             // Every constructor argument must be plainly generatable (implements or derives
             // Arbitrary); constructor arguments do not get the argument-position extensions
             // (slices, smart pointers, nested constructors) in phase 1.
-            if !fn_sig
-                .inputs()
-                .iter()
-                .all(|input| implements_arbitrary(*input, kani_any_def, ty_arbitrary_cache))
-            {
+            if !fn_sig.inputs().iter().all(|input| {
+                !has_escaping_bound_vars(tcx, *input)
+                    && implements_arbitrary(*input, kani_any_def, ty_arbitrary_cache)
+            }) {
                 continue;
             }
             let Some(ctor_args) = ctor_args_with_lifetimes(tcx, item, &GenericArgs(vec![])) else {
