@@ -81,6 +81,14 @@ pub enum KaniModel {
     NondetFn1,
     #[strum(serialize = "NondetFn2Model")]
     NondetFn2,
+    #[strum(serialize = "NondetFn1RefModel")]
+    NondetFn1Ref,
+    #[strum(serialize = "NondetFn2RefRefModel")]
+    NondetFn2RefRef,
+    #[strum(serialize = "NondetFn2RefValModel")]
+    NondetFn2RefVal,
+    #[strum(serialize = "NondetFn2ValRefModel")]
+    NondetFn2ValRef,
     #[strum(serialize = "NondetFn3Model")]
     NondetFn3,
     #[strum(serialize = "AnySliceRefUnboundedModel")]
@@ -216,7 +224,11 @@ impl KaniModel {
                 | KaniModel::AnyVecUnbounded
                 | KaniModel::NondetFn0
                 | KaniModel::NondetFn1
+                | KaniModel::NondetFn1Ref
                 | KaniModel::NondetFn2
+                | KaniModel::NondetFn2RefRef
+                | KaniModel::NondetFn2RefVal
+                | KaniModel::NondetFn2ValRef
                 | KaniModel::NondetFn3
         )
     }

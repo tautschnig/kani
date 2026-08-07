@@ -101,3 +101,20 @@ impl Gauge {
         100_u8.saturating_sub(self.level)
     }
 }
+
+// TEST NOTE (regression, reqwest ICE): HRTB closure param wrapped in a struct and
+// coerced to a trait object. Requires the region-polymorphic nondet_fn1_ref model
+// (an early-bound fn item leaves the method slot vacant in the concrete vtable).
+struct ScopeFn<F>(F);
+trait Scope {
+    fn run(&self) -> bool;
+}
+impl<F: Fn(&u8) -> bool> Scope for ScopeFn<F> {
+    fn run(&self) -> bool {
+        (self.0)(&7)
+    }
+}
+pub fn scoped<F: Fn(&u8) -> bool + 'static>(f: F) -> bool {
+    let s: Box<dyn Scope> = Box::new(ScopeFn(f));
+    s.run()
+}

@@ -112,12 +112,16 @@ impl CodegenUnits {
                     *kani_fns.get(&KaniModel::Any.into()).unwrap(),
                     *kani_fns.get(&KaniModel::BoundedAny.into()).unwrap(),
                     *kani_fns.get(&KaniHook::Assert.into()).unwrap(),
-                    [
-                        kani_fns.get(&KaniModel::NondetFn0.into()).copied(),
-                        kani_fns.get(&KaniModel::NondetFn1.into()).copied(),
-                        kani_fns.get(&KaniModel::NondetFn2.into()).copied(),
-                        kani_fns.get(&KaniModel::NondetFn3.into()).copied(),
-                    ],
+                    &NondetFnModels {
+                        fn0: kani_fns.get(&KaniModel::NondetFn0.into()).copied(),
+                        fn1: kani_fns.get(&KaniModel::NondetFn1.into()).copied(),
+                        fn1_ref: kani_fns.get(&KaniModel::NondetFn1Ref.into()).copied(),
+                        fn2: kani_fns.get(&KaniModel::NondetFn2.into()).copied(),
+                        fn2_ref_ref: kani_fns.get(&KaniModel::NondetFn2RefRef.into()).copied(),
+                        fn2_ref_val: kani_fns.get(&KaniModel::NondetFn2RefVal.into()).copied(),
+                        fn2_val_ref: kani_fns.get(&KaniModel::NondetFn2ValRef.into()).copied(),
+                        fn3: kani_fns.get(&KaniModel::NondetFn3.into()).copied(),
+                    },
                     kani_fns.get(&KaniModel::AnyVecIntoIter.into()).copied(),
                     kani_fns.get(&KaniModel::AnyVecUnbounded.into()).copied(),
                     kani_fns.contains_key(&KaniModel::AnySliceRefUnbounded.into()),
@@ -536,6 +540,47 @@ fn args_satisfy_predicates(tcx: TyCtxt, def: FnDef, args: &GenericArgs) -> bool 
 /// Signature types that themselves mention generic parameters are only usable if those
 /// parameters appear EARLIER in the parameter list (they are substituted with the current
 /// choice by the caller); v1 keeps it simple and only admits fully concrete signatures.
+/// The nondet closure-model FnDefs, keyed by input shape. By-value models fix their
+/// input regions early-bound; the ref-taking variants carry late-bound regions so their
+/// fn items satisfy HRTB bounds like `for<'a> Fn(&'a T)`.
+#[derive(Clone, Copy, Default)]
+pub struct NondetFnModels {
+    pub fn0: Option<FnDef>,
+    pub fn1: Option<FnDef>,
+    pub fn1_ref: Option<FnDef>,
+    pub fn2: Option<FnDef>,
+    pub fn2_ref_ref: Option<FnDef>,
+    pub fn2_ref_val: Option<FnDef>,
+    pub fn2_val_ref: Option<FnDef>,
+    pub fn3: Option<FnDef>,
+}
+
+/// Select the nondet model matching the (erased-region) input types' by-ref/by-value
+/// shape, returning the model and its type arguments (references peeled: the model's own
+/// signature reintroduces them with late-bound regions). Arity-3 ref shapes and deeper
+/// are not modeled (1.5% corpus tail).
+fn select_nondet_model<'tcx>(
+    models: &NondetFnModels,
+    input_tys: &[rustc_middle::ty::Ty<'tcx>],
+) -> Option<(FnDef, Vec<rustc_middle::ty::Ty<'tcx>>)> {
+    let peel = |t: rustc_middle::ty::Ty<'tcx>| match t.kind() {
+        rustc_middle::ty::TyKind::Ref(_, inner, rustc_middle::ty::Mutability::Not) => Some(*inner),
+        _ => None,
+    };
+    let shape: Vec<Option<rustc_middle::ty::Ty>> = input_tys.iter().map(|t| peel(*t)).collect();
+    match shape.as_slice() {
+        [] => models.fn0.map(|m| (m, vec![])),
+        [None] => models.fn1.map(|m| (m, vec![input_tys[0]])),
+        [Some(t)] => models.fn1_ref.map(|m| (m, vec![*t])),
+        [None, None] => models.fn2.map(|m| (m, input_tys.to_vec())),
+        [Some(a), Some(b)] => models.fn2_ref_ref.map(|m| (m, vec![*a, *b])),
+        [Some(a), None] => models.fn2_ref_val.map(|m| (m, vec![*a, input_tys[1]])),
+        [None, Some(b)] => models.fn2_val_ref.map(|m| (m, vec![input_tys[0], *b])),
+        [None, None, None] => models.fn3.map(|m| (m, input_tys.to_vec())),
+        _ => None,
+    }
+}
+
 /// An Fn-bound signature that references other generic parameters (e.g. `F: Fn(T) -> T`):
 /// its concrete form depends on the instantiation chosen for those parameters, so the
 /// candidate fn-item type is constructed per candidate choice
@@ -548,7 +593,7 @@ struct DeferredFnSpec<'tcx> {
 fn fn_bound_candidates<'tcx>(
     tcx: TyCtxt<'tcx>,
     def: FnDef,
-    nondet_fns: &[Option<FnDef>; 4],
+    nondet_fns: &NondetFnModels,
 ) -> (FxHashMap<usize, Vec<Ty>>, FxHashMap<usize, DeferredFnSpec<'tcx>>) {
     let def_id = rustc_internal::internal(tcx, def.def_id());
     let mut out: FxHashMap<usize, Vec<Ty>> = FxHashMap::default();
@@ -595,11 +640,6 @@ fn fn_bound_candidates<'tcx>(
         let rustc_middle::ty::TyKind::Tuple(input_tys) = inputs.kind() else { continue };
         let output = sig_output.get(&idx).copied().unwrap_or(tcx.types.unit);
         use rustc_middle::ty::TypeVisitableExt;
-        let arity = input_tys.len();
-        if arity > 3 {
-            continue;
-        }
-        let Some(model) = nondet_fns[arity] else { continue };
         if inputs.has_param() || output.has_param() {
             // Signature references other generic parameters: defer construction until a
             // candidate choice for those parameters is made.
@@ -609,8 +649,12 @@ fn fn_bound_candidates<'tcx>(
             continue;
         }
         // nondet_fnN<A.., R>: generic args are the inputs followed by the return type.
+        let input_vec: Vec<rustc_middle::ty::Ty> = input_tys.iter().collect();
+        let Some((model, model_tys)) = select_nondet_model(nondet_fns, &input_vec) else {
+            continue;
+        };
         let mut args: Vec<GenericArgKind> =
-            input_tys.iter().map(|t| GenericArgKind::Type(rustc_internal::stable(t))).collect();
+            model_tys.iter().map(|t| GenericArgKind::Type(rustc_internal::stable(t))).collect();
         args.push(GenericArgKind::Type(rustc_internal::stable(output)));
         let args = GenericArgs(args);
         // Instance::resolve does not check trait bounds; the model requires R: Arbitrary
@@ -637,7 +681,7 @@ fn resolve_deferred_fn_slots<'tcx>(
     type_slots: &[usize],
     choice: &mut [Ty],
     deferred: &FxHashMap<usize, DeferredFnSpec<'tcx>>,
-    nondet_fns: &[Option<FnDef>; 4],
+    nondet_fns: &NondetFnModels,
 ) -> bool {
     if deferred.is_empty() {
         return true;
@@ -686,10 +730,12 @@ fn resolve_deferred_fn_slots<'tcx>(
             return false;
         };
         let rustc_middle::ty::TyKind::Tuple(input_tys) = inputs.kind() else { return false };
-        let arity = input_tys.len();
-        let Some(model) = nondet_fns.get(arity).copied().flatten() else { return false };
+        let input_vec: Vec<rustc_middle::ty::Ty> = input_tys.iter().collect();
+        let Some((model, model_tys)) = select_nondet_model(nondet_fns, &input_vec) else {
+            return false;
+        };
         let mut margs: Vec<GenericArgKind> =
-            input_tys.iter().map(|t| GenericArgKind::Type(rustc_internal::stable(t))).collect();
+            model_tys.iter().map(|t| GenericArgKind::Type(rustc_internal::stable(t))).collect();
         margs.push(GenericArgKind::Type(rustc_internal::stable(output)));
         let margs = GenericArgs(margs);
         // As in fn_bound_candidates: enforce the model's own R: Arbitrary bound.
@@ -793,7 +839,7 @@ fn iterator_bound_candidates(
 fn choose_generic_instantiation(
     tcx: TyCtxt,
     fn_item: CrateItem,
-    nondet_fns: &[Option<FnDef>; 4],
+    nondet_fns: &NondetFnModels,
     vec_into_iter: Option<FnDef>,
     vec_unbounded: Option<FnDef>,
 ) -> Result<Instance, String> {
@@ -964,7 +1010,7 @@ fn automatic_harness_partition(
     kani_any_def: FnDef,
     kani_bounded_any_def: FnDef,
     kani_assert_def: FnDef,
-    nondet_fns: [Option<FnDef>; 4],
+    nondet_fns: &NondetFnModels,
     vec_into_iter: Option<FnDef>,
     vec_unbounded: Option<FnDef>,
     unbounded_slice_available: bool,
@@ -1122,7 +1168,7 @@ fn automatic_harness_partition(
             Err(_) => match choose_generic_instantiation(
                 tcx,
                 func,
-                &nondet_fns,
+                nondet_fns,
                 vec_into_iter,
                 vec_unbounded,
             ) {
