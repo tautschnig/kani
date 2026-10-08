@@ -137,12 +137,11 @@ requires a different value will not be found. Note also that a checked construct
 panics for some of its inputs (rather than rejecting them via `Option`/`Result`) turns those
 inputs into harness failures, so this option can trade one class of false alarm for another.
 
-> **Caveat:** if the chosen constructor is *unsatisfiable* for the generated type — an
-> assert-guarded constructor every argument of which trips an assertion, or a checked
-> constructor that always returns `None`/`Err` — the generated body assumes `false` on all
-> paths and the harness becomes **vacuous**, reporting `Success` without checking anything.
-> Kani does not yet detect this case; see
-> [#4757](https://github.com/model-checking/kani/issues/4757).
+If the chosen constructor is *unsatisfiable* for the generated type — an assert-guarded
+constructor every argument of which trips an assertion, or a checked constructor that always
+returns `None`/`Err` — Kani reports the automatic harness as a failure instead of accepting a
+vacuous success. The generated value is still an under-approximation: successful verification
+only covers values admitted by the selected constructor.
 
 ### Mined invariants (--check-invariants)
 

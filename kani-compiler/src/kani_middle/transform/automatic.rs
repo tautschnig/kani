@@ -66,6 +66,9 @@ struct AnyModels {
     /// The FnDef of KaniHook::Assert (rewritten into assumptions when inlining
     /// assert-guarded constructors).
     kani_assert: FnDef,
+    /// The FnDef of KaniHook::Cover, used to reject unsatisfiable constructor
+    /// generation instead of allowing it to make an automatic harness vacuous.
+    kani_cover: FnDef,
     /// The FnDef of KaniModel::AssumeSafe
     kani_assume_safe: FnDef,
     /// The FnDef of KaniModel::BoundedAny
@@ -99,6 +102,7 @@ impl AnyModels {
             kani_any_wtf8_ref: *kani_fns.get(&KaniModel::AnyWtf8Ref.into()).unwrap(),
             kani_assume: *kani_fns.get(&KaniHook::Assume.into()).unwrap(),
             kani_assert: *kani_fns.get(&KaniHook::Assert.into()).unwrap(),
+            kani_cover: *kani_fns.get(&KaniHook::Cover.into()).unwrap(),
             kani_assume_safe: *kani_fns.get(&KaniModel::AssumeSafe.into()).unwrap(),
             kani_bounded_any: *kani_fns.get(&KaniModel::BoundedAny.into()).unwrap(),
             smart_pointer_models: SmartPointerModels::from_kani_functions(kani_fns),
@@ -110,6 +114,13 @@ impl AnyModels {
         }
     }
 }
+
+/// A cover property emitted after a constructor-generated value is successfully
+/// produced. The driver treats an unsatisfiable instance of this marker as an
+/// error, since otherwise an assert-guarded constructor that rejects every
+/// nondeterministic argument would make its caller vacuous.
+pub const CONSTRUCTOR_REACHABILITY_MARKER: &str =
+    "KANI_AUTOMATIC_CONSTRUCTOR_REACHABILITY";
 
 /// Generate `T::any()` implementations for `T`s that do not implement Arbitrary in source code.
 /// Currently limited to structs and enums.
@@ -1660,10 +1671,6 @@ impl AutomaticArbitraryPass {
     /// (c.f. [find_unchecked_constructor][crate::kani_middle::find_unchecked_constructor]).
     /// Returns None if the constructor body contains constructs the inliner does not support.
     ///
-    /// Soundness caveat: if the constructor is unsatisfiable for `ty` (every argument trips an
-    /// assertion), the generated body assumes `false` on all paths and the harness becomes
-    /// vacuous, reporting Success without checking anything. Not yet detected; tracked in
-    /// <https://github.com/model-checking/kani/issues/4757>.
     fn generate_unchecked_ctor_body(
         &self,
         tcx: TyCtxt,
@@ -1716,7 +1723,37 @@ impl AutomaticArbitraryPass {
             InsertPosition::Before,
             Terminator { kind: TerminatorKind::Return, source_info: synthetic_source_info(span) },
         );
+        self.insert_constructor_reachability_check(&mut new_body, &mut source, span);
         Some(new_body.into())
+    }
+
+    /// Emit a cover property at the end of a constructor-generated value.
+    ///
+    /// This is deliberately placed in the generated `kani::any` body rather
+    /// than in the caller: it tests whether the selected constructor itself
+    /// has any successful path. An unreachable marker is conservative (and may
+    /// reject a harness whose surrounding assumptions are inconsistent), but
+    /// it can never turn an invalid proof into a successful one.
+    fn insert_constructor_reachability_check(
+        &self,
+        body: &mut MutableBody,
+        source: &mut SourceInstruction,
+        span: rustc_public::ty::Span,
+    ) {
+        let cover = Instance::resolve(self.models.kani_cover, &GenericArgs(vec![])).unwrap();
+        let unit_lcl = body.new_local(Ty::new_tuple(&[]), span, Mutability::Not);
+        let marker = body.new_str_operand(CONSTRUCTOR_REACHABILITY_MARKER, span);
+        body.insert_call(
+            &cover,
+            source,
+            InsertPosition::Before,
+            vec![Operand::Constant(ConstOperand {
+                span,
+                user_ty: None,
+                const_: MirConst::from_bool(true),
+            }), marker],
+            Place::from(unit_lcl),
+        );
     }
 
     /// Overwrite the default `kani::any()` implementation `body` for a struct with private
@@ -1784,6 +1821,7 @@ impl AutomaticArbitraryPass {
                     source_info: synthetic_source_info(ret_span),
                 },
             );
+            self.insert_constructor_reachability_check(&mut new_body, &mut source, ret_span);
             return new_body.into();
         }
 
@@ -1882,6 +1920,8 @@ impl AutomaticArbitraryPass {
             &mut assign_instr,
             InsertPosition::Before,
         );
+        let mut ok_source = SourceInstruction::Terminator { bb: ok_bb };
+        self.insert_constructor_reachability_check(&mut new_body, &mut ok_source, span);
 
         let switch = Terminator {
             kind: TerminatorKind::SwitchInt {

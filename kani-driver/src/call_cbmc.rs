@@ -26,6 +26,9 @@ use crate::coverage::cov_results::{CoverageRegion, CoverageTerm};
 use crate::session::KaniSession;
 use crate::util::render_command;
 
+const CONSTRUCTOR_REACHABILITY_MARKER: &str =
+    "KANI_AUTOMATIC_CONSTRUCTOR_REACHABILITY";
+
 /// CBMC version and system information
 #[derive(Debug, Clone)]
 pub struct CbmcInfo {
@@ -542,6 +545,28 @@ fn cbmc_reported_prover_status_after_results(items: &[ParserItem]) -> bool {
         .any(|item| matches!(item, ParserItem::ProverStatus { .. }))
 }
 
+/// Whether an automatic constructor generated no reachable value.
+///
+/// Constructor-based `kani::any` generation intentionally filters invalid
+/// arguments with assumptions. If every argument is rejected, the enclosing
+/// harness otherwise has an empty execution set and would report success
+/// vacuously. The compiler emits a cover marker after a successful
+/// constructor path; postprocessing represents an unreachable marker as
+/// `UNREACHABLE` or `UNSATISFIABLE`.
+fn has_unsatisfiable_constructor(properties: &[Property]) -> bool {
+    properties.iter().any(|property| {
+        property.is_cover_property()
+            && property.description.contains(CONSTRUCTOR_REACHABILITY_MARKER)
+            && matches!(
+                property.status,
+                CheckStatus::Unsatisfiable
+                    | CheckStatus::Unreachable
+                    | CheckStatus::Undetermined
+                    | CheckStatus::Unknown
+            )
+    })
+}
+
 impl VerificationResult {
     /// Computes a `VerificationResult` (kani-driver's notion of the result of a CBMC call) from a
     /// `VerificationOutput` (cbmc_output_parser's idea of CBMC results).
@@ -579,6 +604,10 @@ impl VerificationResult {
         {
             let (mut status, mut failed_properties) =
                 verification_outcome_from_properties(&results, should_panic);
+            if has_unsatisfiable_constructor(&results) {
+                status = VerificationStatus::Failure;
+                failed_properties = FailedProperties::Error;
+            }
             // A dropped quantifier makes the analysis unsound: a `kani::assume` containing one is
             // silently not enforced, so a "successful" result may be vacuous. Kani must never
             // report success in that case -- force a failure and (via the rendered error) direct
@@ -1047,6 +1076,26 @@ mod tests {
         let result = verify(output);
         assert_eq!(result.status, VerificationStatus::Failure);
         assert!(matches!(result.results, Err(ExitStatus::IncompleteResults(0))));
+    }
+
+    #[test]
+    fn check_unsatisfiable_constructor_fails() {
+        let mut result = mock_cbmc_output(0, "SUCCESS", &[], Some("success"));
+        let properties = result
+            .processed_items
+            .iter_mut()
+            .find_map(|item| match item {
+                ParserItem::Result { result } => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        let mut marker = properties[0].clone();
+        marker.description = CONSTRUCTOR_REACHABILITY_MARKER.to_owned();
+        marker.property_id.class = "cover".to_owned();
+        marker.status = CheckStatus::Unsatisfiable;
+        properties.push(marker);
+        let result = verify(result);
+        assert_eq!(result.status, VerificationStatus::Failure);
     }
 
     #[test]
