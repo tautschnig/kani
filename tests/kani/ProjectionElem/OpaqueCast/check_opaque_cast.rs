@@ -21,6 +21,10 @@ fn check_unconstrained_upvar() {
         assert_eq!(a, 1u32);
         assert_eq!(b, 2u32);
     };
+    let _ = x;
+    let value: u8 = kani::any();
+    kani::assume(value < 10);
+    assert!(value < 10);
 }
 
 /// Adapted from:
