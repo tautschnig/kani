@@ -1,10 +1,10 @@
 // Copyright Kani Contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // kani-flags: -Z quantifiers
+// kani-verify-fail
 
-//! Test that arithmetic operations (+, -, *, %) work inside quantifier predicates.
-//! These compile to checked arithmetic (OverflowResultPlus, etc.) which must be
-//! inlined as pure expressions for CBMC to accept them.
+//! Checked arithmetic in quantifier predicates is rejected because its runtime
+//! checks cannot be represented soundly inside a pure CBMC expression.
 
 #[kani::proof]
 fn check_addition_in_forall() {

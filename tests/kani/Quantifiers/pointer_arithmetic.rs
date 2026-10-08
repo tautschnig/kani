@@ -1,6 +1,7 @@
 // Copyright Kani Contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // kani-flags: -Z quantifiers
+// kani-verify-fail
 
 //! Tests for pointer arithmetic inside quantifier predicates.
 //! These exercise the intrinsic lowering in `inline_call_as_pure_expr`

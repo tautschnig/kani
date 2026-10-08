@@ -1,6 +1,5 @@
-main.assertion.2\
-	 - Status: SUCCESS\
-	 - Description: "assertion failed: kani::exists!(| i in (0, len) |\
-*rebuilt_ptr.wrapping_byte_offset(4*i as isize) == 0)"
+unsupported_construct.1\
+	 - Status: FAILURE\
+	 - Description: "quantifier predicate contains runtime checks that Kani cannot soundly encode"
 
-VERIFICATION:- SUCCESSFUL
+VERIFICATION:- FAILED

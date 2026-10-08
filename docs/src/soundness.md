@@ -161,6 +161,13 @@ check because Kani's generated closure wrappers are conservatively classified
 as side-effecting. This does not make side-effecting user clauses safe; the
 user remains responsible for keeping them pure.
 
+### Quantified predicates
+
+Quantified predicates containing arithmetic runtime checks, such as overflow,
+division-by-zero, or finite-value checks, are rejected as unsupported. CBMC
+cannot preserve those checks inside a quantified expression, and silently
+dropping one could turn a Rust panic into a successful proof.
+
 ### Other scope-reducing models
 Some options and APIs intentionally change the model being verified:
 

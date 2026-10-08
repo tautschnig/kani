@@ -16,6 +16,7 @@
 //! this structure as input.
 use super::current_fn::CurrentFnCtx;
 use super::vtable_ctx::VtableCtx;
+use crate::codegen_cprover_gotoc::codegen::PropertyClass;
 use crate::codegen_cprover_gotoc::UnsupportedConstructs;
 use crate::codegen_cprover_gotoc::overrides::{GotocHooks, fn_hooks};
 use crate::codegen_cprover_gotoc::utils::full_crate_name;
@@ -456,13 +457,12 @@ impl GotocCtx<'_, '_> {
                             final_expr = Some(e.clone());
                         }
                         _ => {
-                            // Dropping Assert/Assume statements (overflow/div-by-zero
-                            // checks) from quantifier bodies. These cannot be
-                            // represented as pure expressions.
+                            // The pure-expression path cannot represent Assert/Assume
+                            // statements. The quantifier post-pass rejects arithmetic
+                            // runtime checks before this simplification can be used for
+                            // verification.
                             tracing::debug!(
-                                "Dropping checked arithmetic guard in quantifier body. \
-                                 Overflow and division-by-zero checks are not enforced \
-                                 inside quantifier predicates."
+                                "Dropping non-expression statement while simplifying quantifier body"
                             );
                         }
                     }
@@ -719,7 +719,7 @@ impl GotocCtx<'_, '_> {
             // lhs = typecast(qex, c_bool)
             // where qex is either a forall-expression or an exists-expression.
             StmtBody::Assign { lhs, rhs } => {
-                let new_rhs = match &rhs.value() {
+                let new_stmt = match &rhs.value() {
                     ExprValue::Typecast(quantified_expr) => match &quantified_expr.value() {
                         ExprValue::Forall { variable, domain } => {
                             // We store the function symbols we have inlined to avoid recursion.
@@ -728,15 +728,26 @@ impl GotocCtx<'_, '_> {
                             // make inlined labeled unique.
                             //let mut suffix_count: u16 = 0;
 
-                            let end_stmt = Stmt::code_expression(
-                                self.inline_function_calls_in_expr(
+                            let inlined_domain = self
+                                .inline_function_calls_in_expr(
                                     domain,
                                     &mut visited_func_symbols,
                                     suffix_count,
                                 )
-                                .unwrap(),
-                                *domain.location(),
-                            );
+                                .unwrap();
+                            let unsupported_check =
+                                if contains_quantifier_arithmetic_check(&inlined_domain)
+                            {
+                                self.codegen_assert_assume_false(
+                                    PropertyClass::UnsupportedConstruct,
+                                    "quantifier predicate contains runtime checks that Kani cannot soundly encode",
+                                    *domain.location(),
+                                )
+                            } else {
+                                Stmt::skip(*domain.location())
+                            };
+                            let end_stmt =
+                                Stmt::code_expression(inlined_domain, *domain.location());
 
                             // Make the result a statement expression.
                             let res = Expr::forall_expr(
@@ -748,7 +759,17 @@ impl GotocCtx<'_, '_> {
                                     *domain.location(),
                                 ),
                             );
-                            res.cast_to(Type::CInteger(CIntType::Bool))
+                            Stmt::block(
+                                vec![
+                                    unsupported_check,
+                                    Stmt::assign(
+                                        lhs.clone(),
+                                        res.cast_to(Type::CInteger(CIntType::Bool)),
+                                        *stmt.location(),
+                                    ),
+                                ],
+                                *stmt.location(),
+                            )
                         }
                         ExprValue::Exists { variable, domain } => {
                             // We store the function symbols we have inlined to avoid recursion.
@@ -757,15 +778,26 @@ impl GotocCtx<'_, '_> {
                             // make inlined labeled unique.
                             let mut suffix_count = 0;
 
-                            let end_stmt = Stmt::code_expression(
-                                self.inline_function_calls_in_expr(
+                            let inlined_domain = self
+                                .inline_function_calls_in_expr(
                                     domain,
                                     &mut visited_func_symbols,
                                     &mut suffix_count,
                                 )
-                                .unwrap(),
-                                *domain.location(),
-                            );
+                                .unwrap();
+                            let unsupported_check =
+                                if contains_quantifier_arithmetic_check(&inlined_domain)
+                            {
+                                self.codegen_assert_assume_false(
+                                    PropertyClass::UnsupportedConstruct,
+                                    "quantifier predicate contains runtime checks that Kani cannot soundly encode",
+                                    *domain.location(),
+                                )
+                            } else {
+                                Stmt::skip(*domain.location())
+                            };
+                            let end_stmt =
+                                Stmt::code_expression(inlined_domain, *domain.location());
 
                             // Make the result a statement expression.
                             let res = Expr::exists_expr(
@@ -777,13 +809,23 @@ impl GotocCtx<'_, '_> {
                                     *domain.location(),
                                 ),
                             );
-                            res.cast_to(Type::CInteger(CIntType::Bool))
+                            Stmt::block(
+                                vec![
+                                    unsupported_check,
+                                    Stmt::assign(
+                                        lhs.clone(),
+                                        res.cast_to(Type::CInteger(CIntType::Bool)),
+                                        *stmt.location(),
+                                    ),
+                                ],
+                                *stmt.location(),
+                            )
                         }
                         _ => return None,
                     },
                     _ => return None,
                 };
-                Some(Stmt::assign(lhs.clone(), new_rhs, *stmt.location()))
+                Some(new_stmt)
             }
             // Recursively find quantifier expressions.
             StmtBody::Block(old_stmts) => {
@@ -817,11 +859,11 @@ impl GotocCtx<'_, '_> {
                 Some(self.handle_quantifiers_in_stmt(body, suffix_count)?.with_label(*label))
             }
             _ => None,
-        }
     }
+}
 
-    /// Count and return the number of return statements in `stmt`.
-    fn count_return_stmts(stmt: &Stmt) -> usize {
+/// Count and return the number of return statements in `stmt`.
+fn count_return_stmts(stmt: &Stmt) -> usize {
         match stmt.body() {
             StmtBody::Return(_) => 1,
             StmtBody::Block(stmts) => stmts.iter().map(Self::count_return_stmts).sum(),
@@ -1168,6 +1210,135 @@ impl GotocCtx<'_, '_> {
     }
 }
 
+/// Return whether an expression contains an arithmetic runtime check.
+///
+/// CBMC cannot soundly preserve such statements inside a quantified predicate. In particular,
+/// Rust's checked arithmetic emits an assertion for overflow, and silently dropping it can turn a
+/// panic into a successful proof.
+fn contains_quantifier_arithmetic_check(expr: &Expr) -> bool {
+    match expr.value() {
+        ExprValue::AddressOf(e)
+        | ExprValue::ArrayOf { elem: e }
+        | ExprValue::ByteExtract { e, .. }
+        | ExprValue::Dereference(e)
+        | ExprValue::Typecast(e)
+        | ExprValue::UnOp { e, .. } => contains_quantifier_arithmetic_check(e),
+        ExprValue::Array { elems } | ExprValue::Vector { elems } => {
+            elems.iter().any(contains_quantifier_arithmetic_check)
+        }
+        ExprValue::Assign { left, right } => {
+            contains_quantifier_arithmetic_check(left) || contains_quantifier_arithmetic_check(right)
+        }
+        ExprValue::BinOp { lhs, rhs, .. } => {
+            contains_quantifier_arithmetic_check(lhs) || contains_quantifier_arithmetic_check(rhs)
+        }
+        ExprValue::FunctionCall { function, arguments } => {
+            contains_quantifier_arithmetic_check(function)
+                || arguments.iter().any(contains_quantifier_arithmetic_check)
+        }
+        ExprValue::If { c, t, e } => {
+            contains_quantifier_arithmetic_check(c)
+                || contains_quantifier_arithmetic_check(t)
+                || contains_quantifier_arithmetic_check(e)
+        }
+        ExprValue::Index { array, index } => {
+            contains_quantifier_arithmetic_check(array)
+                || contains_quantifier_arithmetic_check(index)
+        }
+        ExprValue::Member { lhs, .. } => contains_quantifier_arithmetic_check(lhs),
+        ExprValue::ReadOk { ptr, size } => {
+            contains_quantifier_arithmetic_check(ptr)
+                || contains_quantifier_arithmetic_check(size)
+        }
+        ExprValue::SelfOp { e, .. } => contains_quantifier_arithmetic_check(e),
+        ExprValue::ShuffleVector { vector1, vector2, indexes } => {
+            contains_quantifier_arithmetic_check(vector1)
+                || contains_quantifier_arithmetic_check(vector2)
+                || indexes.iter().any(contains_quantifier_arithmetic_check)
+        }
+        ExprValue::StatementExpression { statements, .. } => {
+            statements.iter().any(contains_quantifier_arithmetic_check_stmt)
+        }
+        ExprValue::Struct { values } => values.iter().any(contains_quantifier_arithmetic_check),
+        ExprValue::Union { value, .. } => contains_quantifier_arithmetic_check(value),
+        ExprValue::Forall { domain, .. } | ExprValue::Exists { domain, .. } => {
+            contains_quantifier_arithmetic_check(domain)
+        }
+        ExprValue::BoolConstant(_)
+        | ExprValue::CBoolConstant(_)
+        | ExprValue::DoubleConstant(_)
+        | ExprValue::EmptyUnion
+        | ExprValue::Float16Constant(_)
+        | ExprValue::FloatConstant(_)
+        | ExprValue::Float128Constant(_)
+        | ExprValue::IntConstant(_)
+        | ExprValue::Nondet
+        | ExprValue::PointerConstant(_)
+        | ExprValue::StringConstant { .. }
+        | ExprValue::Symbol { .. } => false,
+    }
+}
+
+fn contains_quantifier_arithmetic_check_stmt(stmt: &Stmt) -> bool {
+    match stmt.body() {
+        StmtBody::Assert { property_class, msg, .. } => {
+            let property_class = property_class.to_string();
+            let message = msg.to_string();
+            matches!(property_class.as_str(), "arithmetic_overflow" | "exact_div" | "finite_check")
+                || message.contains("overflow")
+                || message.contains("division")
+                || message.contains("remainder")
+                || message.contains("finite")
+        }
+        StmtBody::Assign { lhs, rhs } => {
+            contains_quantifier_arithmetic_check(lhs)
+                || contains_quantifier_arithmetic_check(rhs)
+        }
+        StmtBody::AtomicBlock(stmts) | StmtBody::Block(stmts) => {
+            stmts.iter().any(contains_quantifier_arithmetic_check_stmt)
+        }
+        StmtBody::Dead(e) | StmtBody::Expression(e) => contains_quantifier_arithmetic_check(e),
+        StmtBody::Decl { lhs, value } => {
+            contains_quantifier_arithmetic_check(lhs)
+                || value.as_ref().is_some_and(contains_quantifier_arithmetic_check)
+        }
+        StmtBody::For { init, cond, update, body } => {
+            contains_quantifier_arithmetic_check_stmt(init)
+                || contains_quantifier_arithmetic_check(cond)
+                || contains_quantifier_arithmetic_check_stmt(update)
+                || contains_quantifier_arithmetic_check_stmt(body)
+        }
+        StmtBody::FunctionCall { lhs, function, arguments } => {
+            lhs.as_ref().is_some_and(contains_quantifier_arithmetic_check)
+                || contains_quantifier_arithmetic_check(function)
+                || arguments.iter().any(contains_quantifier_arithmetic_check)
+        }
+        StmtBody::Ifthenelse { i, t, e } => {
+            contains_quantifier_arithmetic_check(i)
+                || contains_quantifier_arithmetic_check_stmt(t)
+                || e.as_ref().is_some_and(contains_quantifier_arithmetic_check_stmt)
+        }
+        StmtBody::Label { body, .. } => contains_quantifier_arithmetic_check_stmt(body),
+        StmtBody::Return(value) => {
+            value.as_ref().is_some_and(contains_quantifier_arithmetic_check)
+        }
+        StmtBody::Switch { control, cases, default } => {
+            contains_quantifier_arithmetic_check(control)
+                || cases.iter().any(|case| contains_quantifier_arithmetic_check_stmt(case.body()))
+                || default.as_ref().is_some_and(contains_quantifier_arithmetic_check_stmt)
+        }
+        StmtBody::While { cond, body } => {
+            contains_quantifier_arithmetic_check(cond)
+                || contains_quantifier_arithmetic_check_stmt(body)
+        }
+        StmtBody::Assume { .. }
+        | StmtBody::Break
+        | StmtBody::Continue
+        | StmtBody::Goto { .. }
+        | StmtBody::Skip => false,
+    }
+}
+
 /// Mutators
 impl GotocCtx<'_, '_> {
     pub fn set_current_fn(&mut self, instance: Instance, body: &Body) {
@@ -1280,8 +1451,10 @@ impl<'tcx> FnAbiOfHelpers<'tcx> for GotocCtx<'tcx, '_> {
 
 /// Simplify overflow-checked arithmetic results for use in quantifier bodies.
 /// Replaces patterns like `Member(OverflowResultPlus(a, b), "result")` with `Plus(a, b)`.
-/// This drops the overflow check, which is acceptable inside quantifier bodies
-/// where CBMC requires side-effect-free expressions.
+/// This drops the overflow check from the pure expression representation. The
+/// quantifier lowering must separately reject a predicate whose original body
+/// contained such a runtime check; this helper is only a representation
+/// simplification, not a soundness justification.
 #[allow(clippy::collapsible_if, clippy::cmp_owned)]
 fn simplify_overflow_result(expr: &Expr) -> Expr {
     use cbmc::goto_program::BinaryOperator::*;

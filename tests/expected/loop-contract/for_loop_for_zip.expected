@@ -1,9 +1,5 @@
-forloop.loop_invariant_base.1\
-	 - Status: SUCCESS\
-	 - Description: "Check invariant before entry for loop forloop.0"
+unsupported_construct.1\
+	 - Status: FAILURE\
+	 - Description: "quantifier predicate contains runtime checks that Kani cannot soundly encode"
 
-forloop.assertion.4\
-	 - Status: SUCCESS\
-	 - Description: "assertion failed: sum <= 990"
-
-VERIFICATION:- SUCCESSFUL
+VERIFICATION:- FAILED

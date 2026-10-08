@@ -1,19 +1,5 @@
-main.assertion.1\
-         - Status: SUCCESS\
-         - Description: "assertion failed: quan1"
+unsupported_construct.1\
+         - Status: FAILURE\
+         - Description: "quantifier predicate contains runtime checks that Kani cannot soundly encode"
 
-main.assertion.2\
-         - Status: SUCCESS\
-         - Description: "assertion failed: quan2"
-
-main.assertion.3\
-         - Status: SUCCESS\
-         - Description: "assertion failed: quan3"
-
-
-main.assertion.4\
-         - Status: SUCCESS\
-         - Description: "assertion failed: quan4"
-
-VERIFICATION:- SUCCESSFUL
-
+VERIFICATION:- FAILED
