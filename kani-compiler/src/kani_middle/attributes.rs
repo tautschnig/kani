@@ -624,8 +624,10 @@ impl<'tcx> KaniAttributes<'tcx> {
                     self.tcx.dcx().span_err(self.tcx.def_span(self.item), format!("Contracts are not supported on harnesses. (Found the kani-internal contract attribute `{}`)", kind.as_ref()));
                 }
                 KaniAttributeKind::DisableChecks => {
-                    // Internal attribute which shouldn't exist here.
-                    unreachable!()
+                    // User-local uses are rejected by `check_crate_items` before
+                    // harness attributes are extracted. Keep this arm non-panicking
+                    // so malformed input cannot bypass that diagnostic by attaching
+                    // the attribute to a harness.
                 }
                 KaniAttributeKind::FnMarker => {
                     /* no-op */
