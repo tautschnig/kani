@@ -827,9 +827,13 @@ impl ValidateArgs for VerificationArgs {
         let conflicting_options = || -> Result<(), Error> {
             const UNSOUND_CBMC_ARGS: &[&str] = &[
                 "--assert-to-assume",
+                "--cover",
+                "--depth",
                 "--dfcc-simple-invalid-pointer-model",
                 "--function",
+                "--ignore-properties-before-unwind-min",
                 "--max-nondet-tree-depth",
+                "--min-null-tree-depth",
                 "--no-library",
                 "--no-assertions",
                 "--no-bounds-check",
@@ -843,7 +847,12 @@ impl ValidateArgs for VerificationArgs {
                 "--no-undefined-shift-check",
                 "--no-unwinding-assertions",
                 "--no-unsigned-overflow-check",
+                "--partial-loops",
                 "--property",
+                "--symex-complexity-failed-child-loops-limit",
+                "--symex-complexity-limit",
+                "--unwind-max",
+                "--unwind-min",
             ];
             if let Some(argument) = self.cbmc_args.iter().find_map(|argument| {
                 let argument = argument.to_str()?;
@@ -1303,9 +1312,13 @@ mod tests {
     fn check_rejects_unsound_cbmc_args() {
         for argument in [
             "--assert-to-assume",
+            "--cover assertions",
+            "--depth 10",
             "--dfcc-simple-invalid-pointer-model",
             "--function check_other_harness",
+            "--ignore-properties-before-unwind-min",
             "--max-nondet-tree-depth=2",
+            "--min-null-tree-depth=2",
             "--no-library",
             "--no-assertions",
             "--no-bounds-check",
@@ -1319,8 +1332,13 @@ mod tests {
             "--no-undefined-shift-check",
             "--no-unwinding-assertions",
             "--no-unsigned-overflow-check",
+            "--partial-loops",
             "--property foo.assertion.1",
             "--property=foo.assertion.1",
+            "--symex-complexity-failed-child-loops-limit=2",
+            "--symex-complexity-limit 100",
+            "--unwind-max 2",
+            "--unwind-min 1",
         ] {
             let args = format!("kani file.rs -Z unstable-options --cbmc-args {argument}");
             let parsed = StandaloneArgs::try_parse_from(args.split_whitespace()).unwrap();
