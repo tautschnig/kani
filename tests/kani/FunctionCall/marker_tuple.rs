@@ -10,4 +10,7 @@ extern "rust-call" fn foo<T: std::marker::Tuple>(_: T) {}
 #[kani::proof]
 fn main() {
     foo(());
+    let value: u8 = kani::any();
+    kani::assume(value < 10);
+    assert!(value < 10);
 }
