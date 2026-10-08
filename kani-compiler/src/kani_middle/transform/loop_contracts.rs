@@ -1130,8 +1130,11 @@ impl LoopContractPass {
                 let TyKind::RigidTy(RigidTy::Tuple(args)) = arg_ty.kind() else { return false };
                 // Check if the invariant involves any local variable
                 if !args.is_empty() {
-                    let Some(ori_condition_bb_idx) =
-                        new_body.blocks()[terminator_target].terminator.successors().get(1).copied()
+                    let Some(ori_condition_bb_idx) = new_body.blocks()[terminator_target]
+                        .terminator
+                        .successors()
+                        .get(1)
+                        .copied()
                     else {
                         return false;
                     };
