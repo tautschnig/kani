@@ -142,6 +142,19 @@ issue**: the analysis may exclude valid targets, causing Kani to miss real
 failures (false negatives). See
 [#802](https://github.com/model-checking/kani/issues/802) for details.
 
+### Experimental contracts
+Function and loop contracts are still experimental. Contract clauses and loop
+invariants/decreases expressions must be pure: Kani does not generally reject
+side effects in them, and side effects can change the state on which the
+verification condition is checked. A `modifies` expression that can panic is
+also not soundly supported. Treat proofs using such clauses as outside the
+soundness contract.
+
+Loop-contract instrumentation currently disables CBMC's generic side-effect
+check because Kani's generated closure wrappers are conservatively classified
+as side-effecting. This does not make side-effecting user clauses safe; the
+user remains responsible for keeping them pure.
+
 ## Reporting Soundness Issues
 
 If you believe Kani has failed to detect a genuine issue (false negative),
