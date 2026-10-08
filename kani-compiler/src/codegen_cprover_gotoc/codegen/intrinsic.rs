@@ -649,8 +649,15 @@ impl GotocCtx<'_, '_> {
                 if self.is_zst_stable(pointee_type_stable(dst_typ).unwrap()) {
                     // Do not dereference (and assign) a ZST -- same guard as
                     // `codegen_volatile_store`. A ZST pointer may legally be
-                    // dangling-but-aligned, so this path is reachable.
-                    Stmt::skip(loc)
+                    // dangling-but-aligned, so this path is reachable, but it
+                    // must still be non-null. Unaligned access deliberately
+                    // does not check alignment.
+                    self.codegen_assert_assume(
+                        dst.is_nonnull(),
+                        PropertyClass::SafetyCheck,
+                        "null pointer dereference occurred",
+                        loc,
+                    )
                 } else {
                     dst.dereference().assign(src, loc)
                 }
@@ -1887,6 +1894,12 @@ impl GotocCtx<'_, '_> {
         let dst = fargs.remove(0);
         let src = fargs.remove(0);
         let dst_typ = farg_types[0];
+        let nonnull_check = self.codegen_assert_assume(
+            dst.clone().is_nonnull(),
+            PropertyClass::SafetyCheck,
+            "null pointer dereference occurred",
+            loc,
+        );
         let align = self.is_ptr_aligned(dst_typ, dst.clone());
         let align_check = self.codegen_assert_assume(
             align,
@@ -1896,10 +1909,10 @@ impl GotocCtx<'_, '_> {
         );
         if self.is_zst_stable(pointee_type_stable(dst_typ).unwrap()) {
             // do not attempt to dereference (and assign) a ZST
-            align_check
+            Stmt::block(vec![nonnull_check, align_check], loc)
         } else {
             let expr = dst.dereference().assign(src, loc);
-            Stmt::block(vec![align_check, expr], loc)
+            Stmt::block(vec![nonnull_check, align_check, expr], loc)
         }
     }
 
