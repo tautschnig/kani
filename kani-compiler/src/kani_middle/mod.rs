@@ -92,8 +92,10 @@ pub fn check_crate_items(tcx: TyCtxt, ignore_asm: bool, allow_internal_attribute
     // below intentionally only covers crate-level items for the global-asm
     // diagnostic, but internal Kani attributes can appear on methods as well.
     for item in all_local_items() {
-        KaniAttributes::for_def_id(tcx, item.def_id())
-            .check_disable_checks_attribute(allow_internal_attributes);
+        let attributes = KaniAttributes::for_def_id(tcx, item.def_id());
+        attributes.check_disable_checks_attribute(allow_internal_attributes);
+        attributes.check_internal_helper_marker(allow_internal_attributes);
+        attributes.check_internal_contract_attributes(allow_internal_attributes);
     }
 
     for item in tcx.hir_free_items() {

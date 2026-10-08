@@ -825,6 +825,39 @@ impl ValidateArgs for VerificationArgs {
 
         // Check for argument conflicts.
         let conflicting_options = || -> Result<(), Error> {
+            const UNSOUND_CBMC_ARGS: &[&str] = &[
+                "--assert-to-assume",
+                "--dfcc-simple-invalid-pointer-model",
+                "--function",
+                "--max-nondet-tree-depth",
+                "--no-library",
+                "--no-assertions",
+                "--no-bounds-check",
+                "--no-built-in-assertions",
+                "--no-div-by-zero-check",
+                "--no-pointer-check",
+                "--no-pointer-primitive-check",
+                "--no-signed-overflow-check",
+                "--no-standard-checks",
+                "--no-undefined-shift-check",
+                "--no-unwinding-assertions",
+                "--no-unsigned-overflow-check",
+                "--property",
+            ];
+            if let Some(argument) = self.cbmc_args.iter().find_map(|argument| {
+                let argument = argument.to_str()?;
+                let option = argument.split_once('=').map_or(argument, |(option, _)| option);
+                UNSOUND_CBMC_ARGS.contains(&option).then_some(argument)
+            }) {
+                return Err(Error::raw(
+                    ErrorKind::ArgumentConflict,
+                    format!(
+                        "Invalid CBMC argument `{argument}`: it can remove or weaken \
+                         verification obligations. Use Kani's explicit soundness-sensitive \
+                         options instead.",
+                    ),
+                ));
+            }
             let extra_unwind =
                 self.cbmc_args.iter().any(|s| s.to_str().unwrap().starts_with("--unwind"));
             let natives_unwind = self.default_unwind.is_some() || self.unwind.is_some();
@@ -1263,6 +1296,45 @@ mod tests {
             cbmc_args,
             vec!["--json-ui"]
         );
+    }
+
+    #[test]
+    fn check_rejects_unsound_cbmc_args() {
+        for argument in [
+            "--assert-to-assume",
+            "--dfcc-simple-invalid-pointer-model",
+            "--function check_other_harness",
+            "--max-nondet-tree-depth=2",
+            "--no-library",
+            "--no-assertions",
+            "--no-bounds-check",
+            "--no-built-in-assertions",
+            "--no-div-by-zero-check",
+            "--no-pointer-check",
+            "--no-pointer-primitive-check",
+            "--no-signed-overflow-check",
+            "--no-standard-checks",
+            "--no-undefined-shift-check",
+            "--no-unwinding-assertions",
+            "--no-unsigned-overflow-check",
+            "--property foo.assertion.1",
+            "--property=foo.assertion.1",
+        ] {
+            let args = format!("kani file.rs -Z unstable-options --cbmc-args {argument}");
+            let parsed = StandaloneArgs::try_parse_from(args.split_whitespace()).unwrap();
+            let error = parsed.verify_opts.validate().unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{argument}");
+        }
+    }
+
+    #[test]
+    fn check_allows_sound_cbmc_args() {
+        let args = StandaloneArgs::try_parse_from(
+            "kani file.rs -Z unstable-options --cbmc-args --trace --unwindset foo.0:2"
+                .split_whitespace(),
+        )
+        .unwrap();
+        assert!(args.verify_opts.validate().is_ok());
     }
 
     #[test]

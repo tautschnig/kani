@@ -460,6 +460,81 @@ impl<'tcx> KaniAttributes<'tcx> {
         }
     }
 
+    /// Reject user-defined copies of compiler-generated contract and loop helper markers.
+    ///
+    /// These helpers are generated as nested items by Kani's procedural macros. A top-level
+    /// user function carrying one of their markers can otherwise be mistaken for compiler
+    /// instrumentation and have its body replaced or its checks suppressed.
+    pub fn check_internal_helper_marker(&self, allow_internal: bool) {
+        if allow_internal {
+            return;
+        }
+        let Some(marker) = self.fn_marker() else { return };
+        if matches!(
+            marker.as_str(),
+            "kani_contract_mode"
+                | "kani_force_fn_once"
+                | "kani_force_fn_once_with_args"
+                | "kani_register_contract"
+                | "kani_register_loop_contract"
+        ) {
+            let span = self.tcx.def_span(self.item);
+            // Contract and loop macros emit these helper items through a proc-macro
+            // expansion. A source-level copy has no expansion context and must not be
+            // accepted as compiler instrumentation.
+            if !self.is_trusted_kani_macro_span(span) {
+                self.tcx.dcx().span_err(
+                    span,
+                    format!("the internal `{marker}` marker is not permitted in user code"),
+                );
+            }
+        }
+    }
+
+    /// Reject source-level copies of the contract instrumentation attributes.
+    ///
+    /// The contract macros attach these attributes while expanding a user
+    /// function. A user-authored copy can make an ordinary function look like
+    /// an instrumented contract and must not affect transformation or
+    /// automatic-harness discovery.
+    pub fn check_internal_contract_attributes(&self, allow_internal: bool) {
+        if allow_internal {
+            return;
+        }
+        const INTERNAL_ATTRIBUTES: [KaniAttributeKind; 7] = [
+            KaniAttributeKind::AssertedWith,
+            KaniAttributeKind::CheckedWith,
+            KaniAttributeKind::IsContractGenerated,
+            KaniAttributeKind::ModifiesWrapper,
+            KaniAttributeKind::RecursionCheck,
+            KaniAttributeKind::RecursionTracker,
+            KaniAttributeKind::ReplacedWith,
+        ];
+        for kind in INTERNAL_ATTRIBUTES {
+            let Some(attributes) = self.map.get(&kind) else { continue };
+            for attribute in attributes {
+                let span = attribute.span();
+                if !self.is_trusted_kani_macro_span(span) {
+                    self.tcx.dcx().span_err(
+                        span,
+                        format!(
+                            "the internal `{}` attribute is not permitted in user code",
+                            kind.as_ref()
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether a span was produced by Kani's procedural macro crate.
+    fn is_trusted_kani_macro_span(&self, span: Span) -> bool {
+        let expn = span.ctxt().outer_expn();
+        expn.expn_data()
+            .macro_def_id
+            .is_some_and(|def_id| self.tcx.crate_name(def_id.krate).as_str() == "kani_macros")
+    }
+
     /// Get the value of an attribute if one exists.
     ///
     /// This expects up to one attribute with format `#[kanitool::<name>("<value>")]`.

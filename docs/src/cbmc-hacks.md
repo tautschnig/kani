@@ -13,6 +13,14 @@ this "switches modes" from Kani arguments to CBMC arguments: Any arguments that
 appear after `--cbmc-args` are considered to be CBMC arguments, so all Kani
 arguments must be placed before it.
 
+Kani rejects CBMC arguments that disable, convert, or select away verification
+properties, change the CBMC entry point or nondeterministic input domain, or
+disable a required model component. Examples include `--no-assertions`,
+`--assert-to-assume`, `--property`, `--function`, and CBMC's explicitly
+unsound simplified invalid-pointer model. Use Kani's corresponding options
+when you intentionally want a reduced proof scope; those options are recorded
+and reported as part of Kani's model.
+
 Thus, the command line format to invoke `cargo kani` with CBMC arguments is:
 
 ```bash

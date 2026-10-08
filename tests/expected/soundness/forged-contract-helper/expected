@@ -1,0 +1,1 @@
+error: the internal `kani_force_fn_once` marker is not permitted in user code

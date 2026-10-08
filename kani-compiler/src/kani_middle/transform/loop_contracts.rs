@@ -565,7 +565,11 @@ impl LoopContractPass {
             // The basic blocks end with register functions are loop head blocks.
             KaniAttributes::for_def_id(tcx, fn_def.def_id()).fn_marker()
                 == Some(Symbol::intern("kani_register_loop_contract"))
-                && matches!(&terminator_args[1], Operand::Constant(op) if op.const_.eval_target_usize().unwrap() == 0)
+                && matches!(
+                    terminator_args.get(1),
+                    Some(Operand::Constant(op))
+                        if op.const_.eval_target_usize().is_ok_and(|value| value == 0)
+                )
         } else {
             false
         }

@@ -27,6 +27,8 @@ use crate::session::KaniSession;
 use crate::util::render_command;
 
 const CONSTRUCTOR_REACHABILITY_MARKER: &str = "KANI_AUTOMATIC_CONSTRUCTOR_REACHABILITY";
+const CONTRACT_PRECONDITION_REACHABILITY_MARKER: &str =
+    "KANI_FUNCTION_CONTRACT_PRECONDITION_REACHABILITY";
 
 /// CBMC version and system information
 #[derive(Debug, Clone)]
@@ -181,6 +183,8 @@ pub enum FailedProperties {
 pub enum ExitStatus {
     Timeout,
     OutOfMemory,
+    /// CBMC completed but reported no verification properties.
+    NoProperties,
     /// CBMC printed a result array but not the overall status that follows the complete array,
     /// so the results may be truncated; the integer is the process exit status
     IncompleteResults(i32),
@@ -559,6 +563,27 @@ fn has_unsatisfiable_constructor(properties: &[Property]) -> bool {
     })
 }
 
+/// Whether a proof-for-contract target has no reachable precondition-satisfying
+/// execution.
+///
+/// The contract target's preconditions are assumptions in the generated check
+/// closure. If they are unsatisfiable, all ordinary contract obligations can
+/// pass vacuously, so the generated cover marker after the complete
+/// precondition prefix must be reachable before Kani can report success.
+fn has_unsatisfiable_contract_precondition(properties: &[Property]) -> bool {
+    properties.iter().any(|property| {
+        property.is_cover_property()
+            && property.description.contains(CONTRACT_PRECONDITION_REACHABILITY_MARKER)
+            && matches!(
+                property.status,
+                CheckStatus::Unsatisfiable
+                    | CheckStatus::Unreachable
+                    | CheckStatus::Undetermined
+                    | CheckStatus::Unknown
+            )
+    })
+}
+
 impl VerificationResult {
     /// Computes a `VerificationResult` (kani-driver's notion of the result of a CBMC call) from a
     /// `VerificationOutput` (cbmc_output_parser's idea of CBMC results).
@@ -584,12 +609,14 @@ impl VerificationResult {
             cbmc_reported_prover_status_after_results(&output.processed_items);
         let (remaining_items, results) = extract_results(output.processed_items);
         let reported_results = results.is_some();
+        let no_properties = results.as_ref().is_some_and(Vec::is_empty);
 
         // Only `--export-json` consumes these, and collecting them means running several regexes
         // over every message CBMC emitted, so skip the work entirely when nothing will read it.
         let cbmc_stats = if collect_cbmc_stats { merge_cbmc_stats(&remaining_items) } else { None };
 
         if let Some(results) = results
+            && !no_properties
             && reported_prover_status
             && !cbmc_reported_out_of_memory(&remaining_items)
             && cbmc_completed_results(output.process_status, &results)
@@ -597,6 +624,10 @@ impl VerificationResult {
             let (mut status, mut failed_properties) =
                 verification_outcome_from_properties(&results, should_panic);
             if has_unsatisfiable_constructor(&results) {
+                status = VerificationStatus::Failure;
+                failed_properties = FailedProperties::Error;
+            }
+            if has_unsatisfiable_contract_precondition(&results) {
                 status = VerificationStatus::Failure;
                 failed_properties = FailedProperties::Error;
             }
@@ -625,6 +656,8 @@ impl VerificationResult {
             let exit_status =
                 if output.process_status == 137 || cbmc_reported_out_of_memory(&remaining_items) {
                     ExitStatus::OutOfMemory
+                } else if no_properties && reported_prover_status {
+                    ExitStatus::NoProperties
                 } else if reported_results && !reported_prover_status {
                     ExitStatus::IncompleteResults(output.process_status)
                 } else {
@@ -721,6 +754,10 @@ impl VerificationResult {
                         String::from("CBMC failed"),
                         "CBMC timed out. You may want to rerun your proof with a larger timeout \
                     or use stubbing to reduce the size of the code the verifier reasons about.\n",
+                    ),
+                    ExitStatus::NoProperties => (
+                        String::from("CBMC reported no verification properties"),
+                        "No verification obligation was checked, so Kani cannot report a successful proof.\n",
                     ),
                     ExitStatus::IncompleteResults(exit_status) => (
                         format!(
@@ -1014,14 +1051,8 @@ mod tests {
 
     #[test]
     fn check_old_format_timeout_fails() {
-        assert_eq!(
-            old_format_verification_result(Ok(false)).status,
-            VerificationStatus::Success
-        );
-        assert_eq!(
-            old_format_verification_result(Ok(true)).status,
-            VerificationStatus::Failure
-        );
+        assert_eq!(old_format_verification_result(Ok(false)).status, VerificationStatus::Success);
+        assert_eq!(old_format_verification_result(Ok(true)).status, VerificationStatus::Failure);
         assert_eq!(
             old_format_verification_result(Err(anyhow::anyhow!("CBMC failed"))).status,
             VerificationStatus::Failure
@@ -1098,6 +1129,19 @@ mod tests {
     }
 
     #[test]
+    fn check_empty_results_fail() {
+        let result: ParserItem = serde_json::from_str(r#"{"result":[]}"#).unwrap();
+        let status: ParserItem = serde_json::from_str(r#"{"cProverStatus":"success"}"#).unwrap();
+        let output =
+            VerificationOutput { process_status: 0, processed_items: vec![result, status] };
+        let result = verify(output);
+        assert_eq!(result.status, VerificationStatus::Failure);
+        assert!(matches!(result.results, Err(ExitStatus::NoProperties)));
+        let message = result.render(&OutputFormat::Regular, false);
+        assert!(message.contains("CBMC reported no verification properties"));
+    }
+
+    #[test]
     fn check_unsatisfiable_constructor_fails() {
         let mut result = mock_cbmc_output(0, "SUCCESS", &[], Some("success"));
         let properties = result
@@ -1112,6 +1156,26 @@ mod tests {
         marker.description = CONSTRUCTOR_REACHABILITY_MARKER.to_owned();
         marker.property_id.class = "cover".to_owned();
         marker.status = CheckStatus::Unsatisfiable;
+        properties.push(marker);
+        let result = verify(result);
+        assert_eq!(result.status, VerificationStatus::Failure);
+    }
+
+    #[test]
+    fn check_unsatisfiable_contract_precondition_fails() {
+        let mut result = mock_cbmc_output(0, "SUCCESS", &[], Some("success"));
+        let properties = result
+            .processed_items
+            .iter_mut()
+            .find_map(|item| match item {
+                ParserItem::Result { result } => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        let mut marker = properties[0].clone();
+        marker.description = CONTRACT_PRECONDITION_REACHABILITY_MARKER.to_owned();
+        marker.property_id.class = "cover".to_owned();
+        marker.status = CheckStatus::Unreachable;
         properties.push(marker);
         let result = verify(result);
         assert_eq!(result.status, VerificationStatus::Failure);

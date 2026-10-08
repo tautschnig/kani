@@ -17,6 +17,15 @@ use super::{
 const WRAPPER_ARG: &str = "_wrapper_arg";
 
 impl<'a> ContractConditionsHandler<'a> {
+    fn contract_reachability_marker() -> TokenStream2 {
+        quote!(
+            kani::cover(
+                true,
+                "KANI_FUNCTION_CONTRACT_PRECONDITION_REACHABILITY",
+            );
+        )
+    }
+
     /// Create the body of a check function.
     ///
     /// Wraps the conditions from this attribute around `self.body`.
@@ -25,8 +34,18 @@ impl<'a> ContractConditionsHandler<'a> {
         match &self.condition_type {
             ContractConditionsData::Requires { attr } => {
                 let assume_bracketed = bracket_clause_stmt(quote!(kani::assume(#attr);));
+                // Insert the reachability marker exactly once, after the complete
+                // precondition prefix. Subsequent `requires` attributes wrap
+                // this body with another assumption, so inserting a marker for
+                // every attribute could leave one marker before a later
+                // unsatisfiable precondition.
+                let (preconditions, _) =
+                    split_for_remembers(&body_stmts[..], ContractMode::SimpleCheck);
+                let reachability_marker =
+                    preconditions.is_empty().then(|| Self::contract_reachability_marker());
                 quote!({
                     #assume_bracketed
+                    #reachability_marker
                     #(#body_stmts)*
                 })
             }
@@ -44,8 +63,11 @@ impl<'a> ContractConditionsHandler<'a> {
 
                 let (assumes, rest_of_body) =
                     split_for_remembers(&body_stmts[..], ContractMode::SimpleCheck);
+                let reachability_marker =
+                    assumes.is_empty().then(Self::contract_reachability_marker);
 
                 quote!({
+                    #reachability_marker
                     #(#assumes)*
                     #remembers
                     #(#rest_of_body)*
@@ -76,7 +98,14 @@ impl<'a> ContractConditionsHandler<'a> {
                 } else {
                     unreachable!("Expected tuple but found `{wrapper_tuple:?}`")
                 }
-                quote!({#(#body_stmts)*})
+                let (preconditions, _) =
+                    split_for_remembers(&body_stmts[..], ContractMode::SimpleCheck);
+                let reachability_marker =
+                    preconditions.is_empty().then(Self::contract_reachability_marker);
+                quote!({
+                    #reachability_marker
+                    #(#body_stmts)*
+                })
             }
         }
     }

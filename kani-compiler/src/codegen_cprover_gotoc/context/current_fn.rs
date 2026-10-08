@@ -416,10 +416,21 @@ fn is_generated_contract_closure(tcx: TyCtxt, closure_def_id: rustc_span::def_id
         };
         let marker =
             tcx.get_attrs_by_path(callee, &fn_marker_path).next().and_then(|attr| attr.value_str());
+        let Some(marker) = marker else { continue };
         if !matches!(
-            marker.as_ref().map(|marker| marker.as_str()),
-            Some("kani_force_fn_once" | "kani_force_fn_once_with_args" | "kani_register_contract")
+            marker.as_str(),
+            "kani_force_fn_once" | "kani_force_fn_once_with_args" | "kani_register_contract"
         ) {
+            continue;
+        }
+        if tcx.item_name(callee).as_str() != marker.as_str() {
+            continue;
+        }
+        // Contract helpers are generated as nested items inside the function whose contract
+        // clause owns the closure. A user can copy the marker onto an arbitrary top-level (or
+        // otherwise unrelated) function; accepting that marker by string alone would classify a
+        // user closure as non-escaping and suppress the pointer check on a dangling capture.
+        if tcx.opt_parent(callee) != Some(parent) {
             continue;
         }
         for arg in args.iter() {

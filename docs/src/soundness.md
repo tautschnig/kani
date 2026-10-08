@@ -114,6 +114,9 @@ The following classes of undefined behavior are **not detected** by Kani:
 Kani uses [CBMC](https://github.com/diffblue/cbmc) as its verification backend.
 CBMC is a mature tool but, like any complex software, may contain bugs. Kani
 pins a specific CBMC version and runs CBMC's regression suite as part of its CI.
+Kani rejects raw `--cbmc-args` that disable, weaken, or select away verification
+properties. Other CBMC arguments remain an advanced escape hatch and are part
+of the configured model.
 
 ### Bounded verification
 Kani performs bounded model checking. Loops are unwound up to a configurable
@@ -148,7 +151,10 @@ invariants/decreases expressions must be pure: Kani does not generally reject
 side effects in them, and side effects can change the state on which the
 verification condition is checked. A `modifies` expression that can panic is
 also not soundly supported. Treat proofs using such clauses as outside the
-soundness contract.
+soundness contract. `proof_for_contract` additionally requires the generated
+contract-check path to be reachable; an unreachable target or unsatisfiable
+precondition is reported as a failed proof rather than a successful vacuous
+one.
 
 Loop-contract instrumentation currently disables CBMC's generic side-effect
 check because Kani's generated closure wrappers are conservatively classified
@@ -171,10 +177,12 @@ Some options and APIs intentionally change the model being verified:
   conditional on that model matching the deployment platform; replacing a
   system function with an overly precise stub can create false negatives.
 - `kanitool` attributes are compiler-internal implementation details, not
-  user-level assumptions. In particular, user-defined functions cannot acquire
-  Kani's check-disabling or trusted hook/intrinsic behavior merely by copying
-  an internal marker; malformed internal marker shapes are rejected or treated
-  conservatively.
+  user-level assumptions. In particular, user-defined items cannot acquire
+  Kani's check-disabling, contract-instrumentation, or trusted hook/intrinsic
+  behavior merely by copying an internal attribute or marker. Contract and loop
+  helpers are accepted only when their attributes originate in Kani's trusted
+  procedural-macro expansion; malformed internal marker shapes are rejected or
+  treated conservatively.
 
 ## Reporting Soundness Issues
 
