@@ -1,0 +1,1 @@
+error: Invalid CBMC argument `--no-assumptions`: it can remove or weaken verification obligations. Use Kani's explicit soundness-sensitive options instead.
