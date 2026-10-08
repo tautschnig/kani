@@ -811,7 +811,16 @@ impl GotocCtx<'_, '_> {
             // The compiler is currently transitioning how to handle intrinsic fallback body.
             // Until https://github.com/rust-lang/project-stable-mir/issues/79 is implemented
             // we have to check `must_be_overridden` and `has_body`.
-            if def.as_intrinsic().unwrap().must_be_overridden() || !instance.has_body() {
+            // `typed_swap_nonoverlapping` has a compiler-provided fallback body that
+            // lowers to byte-wise copies. That body loses the intrinsic's requirement
+            // that the complete T-sized regions be disjoint, so always use Kani's
+            // dedicated model for it.
+            let is_typed_swap =
+                instance.intrinsic_name().as_deref() == Some("typed_swap_nonoverlapping");
+            if is_typed_swap
+                || def.as_intrinsic().unwrap().must_be_overridden()
+                || !instance.has_body()
+            {
                 return self.codegen_funcall_of_intrinsic(
                     instance,
                     args,

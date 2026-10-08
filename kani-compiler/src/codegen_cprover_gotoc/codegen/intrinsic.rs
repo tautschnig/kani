@@ -2054,15 +2054,30 @@ impl GotocCtx<'_, '_> {
             Stmt::block(vec![x_align_check, y_align_check], loc)
         } else {
             // if(same_object(x, y)) {
-            //   assert(x + 1 <= y || y + 1 <= x);
-            //   assume(x + 1 <= y || y + 1 <= x);
+            //   assert(x + sizeof(T) <= y || y + sizeof(T) <= x);
+            //   assume(x + sizeof(T) <= y || y + sizeof(T) <= x);
             // }
-            let one = Expr::int_constant(1, Type::c_int());
-            let non_overlapping = x
-                .clone()
-                .plus(one.clone())
-                .le(y.clone())
-                .or(y.clone().plus(one.clone()).le(x.clone()));
+            //
+            // GOTO-C pointer arithmetic is byte-based here, so using one as
+            // the endpoint distance would only prove that the pointers are
+            // distinct. That is insufficient for multi-byte values: two
+            // aligned T pointers can still designate overlapping T-sized
+            // regions. Cast to byte pointers explicitly so the arithmetic
+            // below is byte-based even when T is wider than one byte. CBMC
+            // does not support pointer arithmetic on void pointers, so use
+            // `*u8` instead.
+            let pointee_type = pointee_type_stable(farg_types[0]).unwrap();
+            let size = self.layout_of_stable(pointee_type).size.bytes();
+            let size = Expr::int_constant(size, Type::size_t());
+            let byte_ptr = Type::unsigned_int(8).to_pointer();
+            let x_bytes = x.clone().cast_to(byte_ptr.clone());
+            let y_bytes = y.clone().cast_to(byte_ptr);
+            let non_overlapping =
+                x_bytes
+                    .clone()
+                    .plus(size.clone())
+                    .le(y_bytes.clone())
+                    .or(y_bytes.plus(size).le(x_bytes));
             let non_overlapping_check = self.codegen_assert_assume(
                 non_overlapping,
                 PropertyClass::SafetyCheck,
