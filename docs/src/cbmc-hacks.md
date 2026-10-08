@@ -18,9 +18,12 @@ properties, truncate path exploration, change the CBMC entry point or
 nondeterministic input domain, or disable a required model component. Examples
 include `--no-assertions`, `--no-assumptions`, `--assert-to-assume`,
 `--property`, `--function`, `--depth`, and CBMC's explicitly unsound
-simplified invalid-pointer model. Use Kani's corresponding options when you
-intentionally want a reduced proof scope; those options are recorded and
-reported as part of Kani's model.
+simplified invalid-pointer model. Kani also rejects raw overrides of the
+architecture, operating system, data model, byte order, or character
+signedness, because those must match the Rust target used to generate the
+GOTO model. Use Kani's corresponding options when you intentionally want a
+reduced proof scope; those options are recorded and reported as part of
+Kani's model.
 
 Thus, the command line format to invoke `cargo kani` with CBMC arguments is:
 
