@@ -36,6 +36,9 @@ pub fn check_write_with_extern() {
     unsafe {
         __CPROVER_havoc_object(ptr as *mut c_void);
     };
+    let value: u8 = kani::any();
+    kani::assume(value < 10);
+    assert!(value < 10);
 }
 
 /// Kani APIs cannot tell if that's safe to write to a foreign type.
