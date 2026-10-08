@@ -444,6 +444,12 @@ impl GotocCtx<'_, '_> {
             } else {
                 ptr_projection.goto_expr.member("data", &self.symbol_table)
             };
+            checks.push(self.codegen_assert_assume(
+                ptr.clone().is_nonnull(),
+                PropertyClass::SafetyCheck,
+                "null pointer dereference occurred",
+                loc,
+            ));
             let pointee = match pointee_type_stable(ptr_place_ty) {
                 Some(pointee) => pointee,
                 None => {
