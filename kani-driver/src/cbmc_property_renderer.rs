@@ -665,9 +665,10 @@ fn update_results_of_code_covererage_checks(mut properties: Vec<Property>) -> Ve
             prop.status = match prop.status {
                 CheckStatus::Success => CheckStatus::Uncovered,
                 CheckStatus::Failure => CheckStatus::Covered,
-                _ => unreachable!(
-                    "status for coverage checks should be either `SUCCESS` or `FAILURE` prior to postprocessing"
-                ),
+                // A reachable unsupported construct, an unwinding failure, or a solver error
+                // can make coverage results inconclusive before this conversion runs. Preserve
+                // that status instead of panicking or manufacturing a covered/uncovered result.
+                status => status,
             };
         }
     }
@@ -809,4 +810,41 @@ fn annotate_properties_with_reach_results(
         }
     }
     properties
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cbmc_output_parser::{PropertyId, SourceLocation};
+
+    fn property(class: &str, status: CheckStatus, description: &str) -> Property {
+        Property {
+            description: description.to_owned(),
+            property_id: PropertyId { fn_name: None, class: class.to_owned(), id: 1 },
+            source_location: SourceLocation {
+                file: None,
+                function: None,
+                line: None,
+                column: None,
+            },
+            status,
+            reach: None,
+            trace: None,
+        }
+    }
+
+    #[test]
+    fn coverage_postprocessing_preserves_inconclusive_status() {
+        let properties = vec![
+            property(
+                "unsupported_construct",
+                CheckStatus::Failure,
+                "construct is not currently supported by Kani",
+            ),
+            property("code_coverage", CheckStatus::Success, "coverage counter"),
+        ];
+
+        let processed = postprocess_result(properties, true);
+        assert_eq!(processed[1].status, CheckStatus::Undetermined);
+    }
 }

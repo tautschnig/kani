@@ -527,12 +527,19 @@ fn cbmc_reported_out_of_memory(items: &[ParserItem]) -> bool {
     })
 }
 
-/// Whether CBMC reported its overall status (`cProverStatus`). When CBMC prints a result array,
-/// it prints its overall status only after the complete array (`output_overall_result` in
-/// `goto-checker/report_util.cpp`), so a result array without it may be truncated, whatever
-/// stopped CBMC.
-fn cbmc_reported_prover_status(items: &[ParserItem]) -> bool {
-    items.iter().any(|item| matches!(item, ParserItem::ProverStatus { .. }))
+/// Whether CBMC reported its overall status (`cProverStatus`) after the result array. When CBMC
+/// prints a result array, it prints its overall status only after the complete array
+/// (`output_overall_result` in `goto-checker/report_util.cpp`), so an earlier status must not
+/// certify a later/truncated result array.
+fn cbmc_reported_prover_status_after_results(items: &[ParserItem]) -> bool {
+    let Some(result_idx) = items.iter().position(|item| matches!(item, ParserItem::Result { .. }))
+    else {
+        return false;
+    };
+    items
+        .iter()
+        .skip(result_idx + 1)
+        .any(|item| matches!(item, ParserItem::ProverStatus { .. }))
 }
 
 impl VerificationResult {
@@ -546,8 +553,8 @@ impl VerificationResult {
     ///      (Do not mistake lack of results for success: report it as failure.)
     ///
     /// Results are only used if CBMC finished reporting them: it must have printed its overall
-    /// status after the result array (see `cbmc_reported_prover_status`), must not have run out
-    /// of memory, and its exit status must agree (see `cbmc_completed_results`).
+    /// status after the result array (see `cbmc_reported_prover_status_after_results`), must not
+    /// have run out of memory, and its exit status must agree (see `cbmc_completed_results`).
     fn from(
         output: VerificationOutput,
         should_panic: bool,
@@ -556,6 +563,8 @@ impl VerificationResult {
     ) -> VerificationResult {
         let runtime = start_time.elapsed();
         let ignored_quantifiers = count_ignored_quantifiers(&output.processed_items);
+        let reported_prover_status =
+            cbmc_reported_prover_status_after_results(&output.processed_items);
         let (remaining_items, results) = extract_results(output.processed_items);
         let reported_results = results.is_some();
 
@@ -564,7 +573,7 @@ impl VerificationResult {
         let cbmc_stats = if collect_cbmc_stats { merge_cbmc_stats(&remaining_items) } else { None };
 
         if let Some(results) = results
-            && cbmc_reported_prover_status(&remaining_items)
+            && reported_prover_status
             && !cbmc_reported_out_of_memory(&remaining_items)
             && cbmc_completed_results(output.process_status, &results)
         {
@@ -595,7 +604,7 @@ impl VerificationResult {
             let exit_status =
                 if output.process_status == 137 || cbmc_reported_out_of_memory(&remaining_items) {
                     ExitStatus::OutOfMemory
-                } else if reported_results && !cbmc_reported_prover_status(&remaining_items) {
+                } else if reported_results && !reported_prover_status {
                     ExitStatus::IncompleteResults(output.process_status)
                 } else {
                     ExitStatus::Other(output.process_status)
@@ -740,6 +749,16 @@ fn determine_failed_properties(properties: &[Property]) -> FailedProperties {
     if properties.iter().any(|prop| prop.status == CheckStatus::Error) {
         return FailedProperties::Error;
     };
+    // An inconclusive property is not evidence that the checked obligation holds. Normally CBMC
+    // exits with status 5 for UNKNOWN/NOT_CHECKED, and VerificationResult::from rejects that
+    // result before reaching this function. Keep the property-level verdict conservative as well:
+    // this protects against malformed/future CBMC output whose overall status claims success.
+    if properties
+        .iter()
+        .any(|prop| matches!(prop.status, CheckStatus::Undetermined | CheckStatus::Unknown))
+    {
+        return FailedProperties::Other;
+    }
     let failed_properties: Vec<&Property> =
         properties.iter().filter(|prop| prop.status == CheckStatus::Failure).collect();
     // Return `FAILURE` if there isn't at least one failed property
@@ -989,6 +1008,12 @@ mod tests {
         let result = verify(mock_cbmc_output(5, "UNKNOWN", &[], Some("inconclusive")));
         assert_eq!(result.status, VerificationStatus::Failure);
         assert!(matches!(result.results, Err(ExitStatus::Other(5))));
+
+        // Even if a malformed/future CBMC output claims an overall success status, an
+        // inconclusive property must not be turned into a successful verification.
+        let result = verify(mock_cbmc_output(0, "UNKNOWN", &[], Some("success")));
+        assert_eq!(result.status, VerificationStatus::Failure);
+        assert!(matches!(result.failed_properties, FailedProperties::Other));
     }
 
     /// CBMC prints its overall status only after the complete result array, so results without
@@ -1012,6 +1037,16 @@ mod tests {
         let result = verify(mock_cbmc_output(10, "FAILURE", &[], None));
         assert_eq!(result.status, VerificationStatus::Failure);
         assert!(matches!(result.results, Err(ExitStatus::IncompleteResults(10))));
+
+        // An overall status that appeared before the result array cannot certify that the array
+        // was complete.
+        let mut output = mock_cbmc_output(0, "SUCCESS", &[], Some("success"));
+        let early_status: ParserItem =
+            serde_json::from_str(r#"{ "cProverStatus": "success" }"#).unwrap();
+        output.processed_items.insert(0, early_status);
+        let result = verify(output);
+        assert_eq!(result.status, VerificationStatus::Failure);
+        assert!(matches!(result.results, Err(ExitStatus::IncompleteResults(0))));
     }
 
     #[test]
