@@ -10,7 +10,9 @@ fn check_foo() {
     fn f() {}
 
     foo(&mut f);
-    assert!(true);
+    let value: u8 = kani::any();
+    kani::assume(value < 10);
+    assert!(value < 10);
 }
 
 #[kani::proof]
@@ -18,7 +20,9 @@ fn check_foo_dyn() {
     fn f() {}
 
     foo_dyn(&mut f);
-    assert!(true);
+    let value: u8 = kani::any();
+    kani::assume(value < 10);
+    assert!(value < 10);
 }
 
 #[kani::proof]
@@ -26,5 +30,7 @@ fn check_foo_unused() {
     fn f() {}
 
     let ptr = &mut f;
-    assert!(true);
+    let value: u8 = kani::any();
+    kani::assume(value < 10);
+    assert!(value < 10);
 }

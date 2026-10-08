@@ -17,5 +17,7 @@ fn main() {
     let arg0: c_long = 0;
     let arg1: c_long = 1;
     let _x = unsafe { syscall(0, arg0, arg1) };
-    assert!(true);
+    let value: u8 = kani::any();
+    kani::assume(value < 10);
+    assert!(value < 10);
 }
