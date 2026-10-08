@@ -2033,8 +2033,25 @@ impl GotocCtx<'_, '_> {
         let y = fargs.remove(0);
 
         if self.is_zst_stable(pointee_type_stable(farg_types[0]).unwrap()) {
-            // do not attempt to dereference (and assign) a ZST
-            Stmt::skip(loc)
+            // Do not attempt to dereference (and assign) a ZST, but preserve
+            // the alignment requirement of typed swap. There is no CBMC
+            // storage access left to enforce it once the swap itself is
+            // elided.
+            let x_align = self.is_ptr_aligned(farg_types[0], x.clone());
+            let y_align = self.is_ptr_aligned(farg_types[1], y.clone());
+            let x_align_check = self.codegen_assert_assume(
+                x_align,
+                PropertyClass::SafetyCheck,
+                "`x` must be properly aligned",
+                loc,
+            );
+            let y_align_check = self.codegen_assert_assume(
+                y_align,
+                PropertyClass::SafetyCheck,
+                "`y` must be properly aligned",
+                loc,
+            );
+            Stmt::block(vec![x_align_check, y_align_check], loc)
         } else {
             // if(same_object(x, y)) {
             //   assert(x + 1 <= y || y + 1 <= x);
