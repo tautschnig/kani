@@ -670,6 +670,13 @@ pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut register_name: String = "kani_register_loop_contract".to_owned();
     register_name.push_str(&loop_id);
     let register_ident = format_ident!("{}", register_name);
+    // Preserve the proc-macro provenance of this internal marker even though
+    // the surrounding generated code uses the invariant's span for useful
+    // diagnostics. The compiler uses this provenance to reject source-level
+    // copies of the marker.
+    let marker_attr = quote! {
+        #[kanitool::fn_marker = "kani_register_loop_contract"]
+    };
 
     match &mut loop_stmt {
         &mut Stmt::Expr(ref mut e, _) => match *e {
@@ -729,7 +736,7 @@ pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
     }) = for_loop_extras
     {
         if has_prev {
-            quote_spanned!(original_span =>
+            quote! {
             {
             #init_iter_stmt
             #init_len_stmt
@@ -750,8 +757,8 @@ pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
             // Dummy function used to force the compiler to capture the environment.
             // We cannot call closures inside constant functions.
             // This function gets replaced by `kani::internal::call_closure`.
+                #marker_attr
                 #[inline(never)]
-                #[kanitool::fn_marker = "kani_register_loop_contract"]
                 const fn #register_ident<F: Fn() -> bool>(_f: &F, _transformed: usize) -> bool {
                     true
                 }
@@ -761,10 +768,11 @@ pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
                 assert!(#inv_expr);
             };
             }
-            })
+            }
+            }
             .into()
         } else {
-            quote_spanned!(original_span =>
+            quote! {
             {
             #init_iter_stmt
             #init_len_stmt
@@ -777,18 +785,19 @@ pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // Dummy function used to force the compiler to capture the environment.
                 // We cannot call closures inside constant functions.
                 // This function gets replaced by `kani::internal::call_closure`.
+                #marker_attr
                 #[inline(never)]
-                #[kanitool::fn_marker = "kani_register_loop_contract"]
                 const fn #register_ident<F: Fn() -> bool>(_f: &F, _transformed: usize) -> bool {
                     true
                 }
                 #loop_stmt
             }
-            })
+            }
+            }
             .into()
         }
     } else if has_prev {
-        quote_spanned!(original_span =>
+        quote! {
         {
         if (#loop_guard) {
             #(#onentry_decl_stms)*
@@ -803,8 +812,8 @@ pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // Dummy function used to force the compiler to capture the environment.
                 // We cannot call closures inside constant functions.
                 // This function gets replaced by `kani::internal::call_closure`.
+                #marker_attr
                 #[inline(never)]
-                #[kanitool::fn_marker = "kani_register_loop_contract"]
                 const fn #register_ident<F: Fn() -> bool>(_f: &F, _transformed: usize) -> bool {
                     true
                 }
@@ -814,22 +823,24 @@ pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
                 assert!(#inv_expr);
             };
         }
-        })
+        }
+        }
         .into()
     } else {
-        quote_spanned!(original_span =>
+        quote! {
         {
         #(#onentry_decl_stms)*
         // Dummy function used to force the compiler to capture the environment.
         // We cannot call closures inside constant functions.
         // This function gets replaced by `kani::internal::call_closure`.
+        #marker_attr
         #[inline(never)]
-        #[kanitool::fn_marker = "kani_register_loop_contract"]
         const fn #register_ident<F: Fn() -> bool>(_f: &F, _transformed: usize) -> bool {
             true
         }
         #loop_stmt
-        })
+        }
+        }
         .into()
     };
     ret

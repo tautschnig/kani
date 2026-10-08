@@ -483,7 +483,17 @@ impl<'tcx> KaniAttributes<'tcx> {
                 | "kani_register_contract"
                 | "kani_register_loop_contract"
         ) {
-            let span = self.tcx.def_span(self.item);
+            // Some Kani macros intentionally apply the helper marker with a
+            // user-derived diagnostic span (for example, loop invariants use
+            // `quote_spanned!` so errors point at the invariant). The item
+            // definition span therefore does not reliably retain the macro
+            // expansion provenance. The marker attribute itself does.
+            let span = self
+                .map
+                .get(&KaniAttributeKind::FnMarker)
+                .and_then(|attrs| attrs.first())
+                .map(|attribute| attribute.span())
+                .unwrap_or_else(|| self.tcx.def_span(self.item));
             // Contract and loop macros emit these helper items through a proc-macro
             // expansion. A source-level copy has no expansion context and must not be
             // accepted as compiler instrumentation.

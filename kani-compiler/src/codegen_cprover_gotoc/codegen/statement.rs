@@ -184,9 +184,23 @@ impl GotocCtx<'_, '_> {
                     self.current_loop_decreases = Some(decreases_expr);
                     return Stmt::skip(location);
                 }
-                // we ignore assignment for all zero size types
+                // A zero-sized destination has no storage to update, but a
+                // right-hand side containing a raw zero-sized load still
+                // needs its alignment check.
                 if self.is_zst_stable(lty) {
-                    Stmt::skip(location)
+                    let mut places = Vec::new();
+                    collect_rvalue_places(rhs, &mut places);
+                    let checks = places
+                        .into_iter()
+                        .filter_map(|place| {
+                            self.codegen_zst_raw_ptr_deref_alignment_check(place, location)
+                        })
+                        .collect::<Vec<_>>();
+                    if checks.is_empty() {
+                        Stmt::skip(location)
+                    } else {
+                        Stmt::block(checks, location)
+                    }
                 } else if lty.kind().is_fn_ptr() && rty.kind().is_fn() && !rty.kind().is_fn_ptr() {
                     // implicit address of a function pointer, e.g.
                     // let fp: fn() -> i32 = foo;

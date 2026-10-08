@@ -563,7 +563,22 @@ impl GotocCtx<'_, '_> {
             let variant_layout;
             let fields = match &layout.variants {
                 Variants::Empty => {
-                    unreachable!("Aggregate expression for uninhabited enum with no variants")
+                    // An aggregate of an uninhabited type cannot occur in a
+                    // well-defined Rust execution. Keep the impossible path
+                    // explicit instead of panicking during code generation:
+                    // the latter could bypass Kani's normal failure handling.
+                    return Expr::statement_expression(
+                        vec![
+                            self.codegen_assert_assume_false(
+                                PropertyClass::Unreachable,
+                                "aggregate expression for an uninhabited type",
+                                loc,
+                            ),
+                            Expr::nondet(typ.clone()).as_stmt(loc),
+                        ],
+                        typ,
+                        loc,
+                    );
                 }
                 Variants::Single { index } => {
                     if *index != rustc_internal::internal(self.tcx, variant_index) {
@@ -908,10 +923,10 @@ impl GotocCtx<'_, '_> {
                         assert_eq!(len_typ, dst_goto_typ);
                         src_goto_expr.member("len", &self.symbol_table)
                     } else {
-                        unreachable!(
-                            "fat pointer with neither vtable nor len: {:?}",
-                            src_goto_expr
-                        );
+                        // Sized pointees have unit metadata. Their pointers
+                        // are thin, so there is no `len` or `vtable` field
+                        // to project.
+                        Expr::init_unit(dst_goto_typ, &self.symbol_table)
                     }
                 }
             },
@@ -935,6 +950,19 @@ impl GotocCtx<'_, '_> {
             // A CopyForDeref is equivalent to a read from a place at the codegen level.
             // https://github.com/rust-lang/rust/blob/1673f1450eeaf4a5452e086db0fe2ae274a0144f/compiler/rustc_middle/src/mir/syntax.rs#L1055
             Rvalue::CopyForDeref(place) => {
+                if let Some(alignment_check) =
+                    self.codegen_zst_raw_ptr_deref_alignment_check(place, loc)
+                {
+                    let typ = self.codegen_ty_stable(self.place_ty_stable(place));
+                    return Expr::statement_expression(
+                        vec![
+                            alignment_check,
+                            Expr::init_unit(typ.clone(), &self.symbol_table).as_stmt(loc),
+                        ],
+                        typ,
+                        loc,
+                    );
+                }
                 unwrap_or_return_codegen_unimplemented!(self, self.codegen_place_stable(place, loc))
                     .goto_expr
             }

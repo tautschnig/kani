@@ -19,6 +19,7 @@
 //!
 
 use super::source_region::SourceRegion;
+use super::ty_stable::pointee_type_stable;
 use crate::codegen_cprover_gotoc::GotocCtx;
 use cbmc::InternedString;
 use cbmc::goto_program::{Expr, Location, Stmt, Type};
@@ -397,5 +398,87 @@ impl GotocCtx<'_, '_> {
             }
         }
         None
+    }
+
+    /// Raw loads of zero-sized values do not necessarily reach a CBMC
+    /// dereference, so CBMC cannot enforce the pointee's alignment for them.
+    /// Rust still requires a raw pointer used by `ptr::read`/a MIR load to be
+    /// properly aligned, including when the pointee has size zero.
+    pub fn codegen_zst_raw_ptr_deref_alignment_check(
+        &mut self,
+        place: &Place,
+        loc: Location,
+    ) -> Option<Stmt> {
+        let place_ty = self.place_ty_stable(place);
+        if !self.is_zst_stable(place_ty) {
+            return None;
+        }
+
+        let mut matched_raw_deref = false;
+        let mut checks = Vec::new();
+        for (idx, projection) in place.projection.iter().enumerate() {
+            if !matches!(projection, ProjectionElem::Deref) {
+                continue;
+            }
+
+            let mut ptr_place = place.clone();
+            ptr_place.projection.truncate(idx);
+            let ptr_place_ty = self.place_ty_stable(&ptr_place);
+            if !ptr_place_ty.kind().is_raw_ptr() {
+                continue;
+            }
+
+            matched_raw_deref = true;
+            let ptr_projection = match self.codegen_place_stable(&ptr_place, loc) {
+                Ok(projection) => projection,
+                Err(err) => {
+                    return Some(self.codegen_unimplemented_stmt(
+                        err.operation.as_str(),
+                        err.loc,
+                        err.bug_url.as_str(),
+                    ));
+                }
+            };
+            let ptr = if self.use_thin_pointer_stable(ptr_place_ty) {
+                ptr_projection.goto_expr
+            } else {
+                ptr_projection.goto_expr.member("data", &self.symbol_table)
+            };
+            let pointee = match pointee_type_stable(ptr_place_ty) {
+                Some(pointee) => pointee,
+                None => {
+                    return Some(self.codegen_unimplemented_stmt(
+                        "zero-sized raw pointer dereference alignment check",
+                        loc,
+                        "https://github.com/model-checking/kani/issues",
+                    ));
+                }
+            };
+            let align = self.layout_of_stable(pointee).align.abi.bytes();
+            if align == 1 {
+                continue;
+            }
+            let aligned = ptr
+                .cast_to(Type::size_t())
+                .rem(Expr::int_constant(align, Type::size_t()))
+                .eq(Type::size_t().zero());
+            checks.push(self.codegen_assert_assume(
+                aligned,
+                PropertyClass::SafetyCheck,
+                "misaligned pointer dereference: address must be a multiple of its type's alignment",
+                loc,
+            ));
+        }
+
+        if !matched_raw_deref {
+            None
+        } else if checks.is_empty() {
+            // Even an alignment-1 pointer load must not be lowered as a typed
+            // CBMC dereference: the load is semantically checked, but its
+            // result has no storage and therefore has no expression to emit.
+            Some(Stmt::skip(loc))
+        } else {
+            Some(Stmt::block(checks, loc))
+        }
     }
 }

@@ -40,6 +40,20 @@ impl<'tcx, 'r> GotocCtx<'tcx, 'r> {
             Operand::Copy(place) | Operand::Move(place) =>
             // TODO: move is an opportunity to poison/nondet the original memory.
             {
+                let loc = Location::none();
+                if let Some(alignment_check) =
+                    self.codegen_zst_raw_ptr_deref_alignment_check(place, loc)
+                {
+                    let typ = self.codegen_ty_stable(self.operand_ty_stable(operand));
+                    return Expr::statement_expression(
+                        vec![
+                            alignment_check,
+                            Expr::init_unit(typ.clone(), &self.symbol_table).as_stmt(loc),
+                        ],
+                        typ,
+                        loc,
+                    );
+                }
                 let projection = unwrap_or_return_codegen_unimplemented!(
                     self,
                     self.codegen_place_stable(place, Location::none())

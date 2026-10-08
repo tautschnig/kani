@@ -1,0 +1,2 @@
+Failed Checks: misaligned pointer dereference: address must be a multiple of its type's alignment
+VERIFICATION:- FAILED
