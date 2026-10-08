@@ -122,7 +122,15 @@ impl<'a> UninitInstrumenter<'a> {
     ) -> (bool, MutableBody) {
         // Need to break infinite recursion when memory initialization checks are inserted, so the
         // internal functions responsible for memory initialization are skipped.
-        if KaniFunction::try_from(instance).map(|f| SKIPPED_ITEMS.contains(&f)).unwrap_or(false) {
+        if KaniFunction::try_from(instance)
+            .and_then(|function| {
+                self.mem_init_fn_cache
+                    .get(&function)
+                    .filter(|def| **def == instance.def)
+                    .map(|_| function)
+            })
+            .is_some_and(|function| SKIPPED_ITEMS.contains(&function))
+        {
             return (false, body);
         }
 

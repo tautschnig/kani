@@ -108,7 +108,7 @@ impl<'tcx, 'r> GotocCtx<'tcx, 'r> {
         machine_model: &MachineModel,
         transformer: &'r mut BodyTransformation,
     ) -> GotocCtx<'tcx, 'r> {
-        let fhks = fn_hooks();
+        let fhks = fn_hooks(queries.kani_functions());
         let symbol_table = SymbolTable::new(machine_model.clone());
         let emit_vtable_restrictions = queries.args().emit_vtable_restrictions;
         GotocCtx {

@@ -1449,7 +1449,7 @@ fn collect_assignments(stmt: &Stmt, map: &mut HashMap<InternedString, Expr>) {
     }
 }
 
-pub fn fn_hooks() -> GotocHooks {
+pub fn fn_hooks(kani_functions: &HashMap<KaniFunction, rustc_public::ty::FnDef>) -> GotocHooks {
     let kani_lib_hooks = [
         (KaniHook::Assert, Rc::new(Assert) as Rc<dyn GotocHook>),
         (KaniHook::Assume, Rc::new(Assume)),
@@ -1472,6 +1472,13 @@ pub fn fn_hooks() -> GotocHooks {
     ];
     GotocHooks {
         kani_lib_hooks: HashMap::from(kani_lib_hooks),
+        kani_lib_hook_defs: kani_functions
+            .iter()
+            .filter_map(|(function, def)| match function {
+                KaniFunction::Hook(hook) => Some((*hook, *def)),
+                KaniFunction::Model(_) | KaniFunction::Intrinsic(_) => None,
+            })
+            .collect(),
         other_hooks: vec![
             Rc::new(Panic),
             Rc::new(RustAlloc),
@@ -1485,6 +1492,12 @@ pub struct GotocHooks {
     /// Match functions that are unique and defined in the Kani library, which we can prefetch
     /// using `KaniFunctions`.
     kani_lib_hooks: HashMap<KaniHook, Rc<dyn GotocHook>>,
+    /// The exact Kani-library definitions to which the hook markers are allowed to apply.
+    ///
+    /// The `fn_marker` tool attribute is visible to user code, so the marker string alone is
+    /// not an authentication mechanism. Without this map, a user function marked
+    /// `AssumeHook`, for example, would have its body replaced by an assumption.
+    kani_lib_hook_defs: HashMap<KaniHook, rustc_public::ty::FnDef>,
     /// Match functions that are not defined in the Kani library, which we cannot prefetch
     /// beforehand.
     other_hooks: Vec<Rc<dyn GotocHook>>,
@@ -1495,6 +1508,7 @@ impl GotocHooks {
         let fn_attr = attributes::fn_marker(instance.def);
         if let Some(ref fn_attr) = fn_attr
             && let Some(KaniFunction::Hook(hook)) = try_get_kani_function(fn_attr)
+            && self.kani_lib_hook_defs.get(&hook).is_some_and(|def| *def == instance.def)
         {
             return Some(self.kani_lib_hooks[&hook].clone());
         }

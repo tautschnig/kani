@@ -70,8 +70,14 @@ impl TransformPass for IntrinsicGeneratorPass {
     fn transform(&mut self, tcx: TyCtxt, body: Body, instance: Instance) -> (bool, Body) {
         trace!(function=?instance.name(), "transform");
         let attributes = KaniAttributes::for_instance(tcx, instance);
-        if let Some(kani_intrinsic) =
-            attributes.fn_marker().and_then(|name| KaniIntrinsic::from_str(name.as_str()).ok())
+        if let Some(kani_intrinsic) = attributes
+            .fn_marker()
+            .and_then(|name| KaniIntrinsic::from_str(name.as_str()).ok())
+            .filter(|kani_intrinsic| {
+                self.kani_defs
+                    .get(&(*kani_intrinsic).into())
+                    .is_some_and(|def| *def == instance.def)
+            })
         {
             match kani_intrinsic {
                 // `fn_marker` is an internal attribute, but nothing prevents user code from
