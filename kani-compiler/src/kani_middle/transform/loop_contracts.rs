@@ -1079,32 +1079,36 @@ impl LoopContractPass {
             // The basic blocks end with register functions are loop head blocks.
             if KaniAttributes::for_def_id(tcx, fn_def.def_id()).fn_marker()
                 == Some(Symbol::intern("kani_register_loop_contract"))
-                && matches!(&terminator_args[1], Operand::Constant(op) if op.const_.eval_target_usize().unwrap() == 0)
+                && matches!(
+                    terminator_args.get(1),
+                    Some(Operand::Constant(op)) if op.const_.eval_target_usize().unwrap_or(usize::MAX) == 0
+                )
             {
-                let loop_termination_block_id = *new_body.blocks()[terminator_target.unwrap()]
-                    .terminator
-                    .clone()
-                    .successors()
-                    .first()
-                    .unwrap();
+                // Check if the MIR satisfy the assumptions of this transformation.
+                let Some(terminator_target) = *terminator_target else { return false };
+                let Some(loop_termination_block_id) = new_body
+                    .blocks()
+                    .get(terminator_target)
+                    .and_then(|block| block.terminator.successors().first().copied())
+                else {
+                    return false;
+                };
+                if !new_body.blocks()[terminator_target].statements.is_empty()
+                    || !matches!(
+                        new_body.blocks()[terminator_target].terminator.kind,
+                        TerminatorKind::SwitchInt { .. }
+                    )
+                {
+                    return false;
+                }
                 let loop_latch_ids = self.get_all_loop_latch_ids(new_body, bb_idx);
                 for loop_latch_id in loop_latch_ids {
                     self.move_storagedead(new_body, loop_latch_id, loop_termination_block_id);
                 }
 
-                // Check if the MIR satisfy the assumptions of this transformation.
-                if !new_body.blocks()[terminator_target.unwrap()].statements.is_empty()
-                    || !matches!(
-                        new_body.blocks()[terminator_target.unwrap()].terminator.kind,
-                        TerminatorKind::SwitchInt { .. }
-                    )
-                {
-                    unreachable!(
-                        "The assumptions for loop-contracts transformation are violated by some other transformation. \
-                    Please report github.com/model-checking/kani/issues/new?template=bug_report.md"
-                    );
-                }
-                let GenericArgKind::Type(arg_ty) = genarg.0[0] else { return false };
+                let Some(GenericArgKind::Type(arg_ty)) = genarg.0.first().copied() else {
+                    return false;
+                };
                 let TyKind::RigidTy(RigidTy::Closure(_, genarg)) = arg_ty.kind() else {
                     return false;
                 };
@@ -1120,12 +1124,17 @@ impl LoopContractPass {
                         break;
                     }
                 }
-                let GenericArgKind::Type(arg_ty) = genarg.0[fnptrpos + 1] else { return false };
+                let Some(GenericArgKind::Type(arg_ty)) = genarg.0.get(fnptrpos + 1).copied() else {
+                    return false;
+                };
                 let TyKind::RigidTy(RigidTy::Tuple(args)) = arg_ty.kind() else { return false };
                 // Check if the invariant involves any local variable
                 if !args.is_empty() {
-                    let ori_condition_bb_idx =
-                        new_body.blocks()[terminator_target.unwrap()].terminator.successors()[1];
+                    let Some(ori_condition_bb_idx) =
+                        new_body.blocks()[terminator_target].terminator.successors().get(1).copied()
+                    else {
+                        return false;
+                    };
                     self.make_invariant_closure_alive(new_body, ori_condition_bb_idx);
                 }
 
