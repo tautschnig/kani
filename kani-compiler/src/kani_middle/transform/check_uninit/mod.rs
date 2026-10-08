@@ -10,6 +10,7 @@ use crate::kani_middle::transform::body::{
 };
 use relevant_instruction::{InitRelevantInstruction, MemoryInitOp};
 use rustc_public::{
+    CrateDef,
     mir::{
         AggregateKind, BasicBlock, Body, ConstOperand, Mutability, Operand, Place, Rvalue,
         Statement, StatementKind, Terminator, TerminatorKind, UnwindAction, mono::Instance,
