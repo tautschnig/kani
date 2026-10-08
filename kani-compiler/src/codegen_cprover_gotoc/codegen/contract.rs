@@ -182,11 +182,12 @@ impl GotocCtx<'_, '_> {
 
         let assigns: Vec<_> = modifies_tys
             .into_iter()
-            // do not attempt to dereference (and assign) a ZST
-            .filter(|ty| !self.is_zst_stable(pointee_type_stable(*ty).unwrap()))
             .enumerate()
-            .map(|(idx, ty)| {
-                let ptr = modifies_args.clone().member(idx.to_string(), &self.symbol_table);
+            // do not attempt to dereference (and assign) a ZST
+            .filter(|(_, ty)| !self.is_zst_stable(pointee_type_stable(*ty).unwrap()))
+            .map(|(original_idx, ty)| {
+                let ptr =
+                    modifies_args.clone().member(original_idx.to_string(), &self.symbol_table);
                 if self.is_fat_pointer_stable(ty) {
                     let unref = match ty.kind() {
                         TyKind::RigidTy(RigidTy::RawPtr(pointee_ty, _)) => pointee_ty,
