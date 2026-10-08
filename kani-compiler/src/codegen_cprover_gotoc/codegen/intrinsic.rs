@@ -1189,6 +1189,21 @@ impl GotocCtx<'_, '_> {
         let (len_var, len_decl) = self.decl_temp_variable(len.typ().clone(), Some(len), loc);
         let (lhs_var, lhs_decl) = self.decl_temp_variable(lhs.typ().clone(), Some(lhs), loc);
         let (rhs_var, rhs_decl) = self.decl_temp_variable(rhs.typ().clone(), Some(rhs), loc);
+        // `compare_bytes` requires both pointers to be non-null even when no bytes are
+        // compared. For nonzero lengths, the `memcmp` model checks dereferenceability; for
+        // zero lengths, the explicit checks are needed because the comparison is short-circuited.
+        let lhs_nonnull_check = self.codegen_assert_assume(
+            lhs_var.clone().is_nonnull(),
+            PropertyClass::SafetyCheck,
+            "`lhs` must be non-null",
+            loc,
+        );
+        let rhs_nonnull_check = self.codegen_assert_assume(
+            rhs_var.clone().is_nonnull(),
+            PropertyClass::SafetyCheck,
+            "`rhs` must be non-null",
+            loc,
+        );
         let is_len_zero = len_var.clone().is_zero();
         // We have to ensure that the pointers are valid even if we're comparing zero bytes.
         // According to Rust's current definition (see https://github.com/model-checking/kani/issues/1489),
@@ -1209,7 +1224,17 @@ impl GotocCtx<'_, '_> {
                 .cast_to(place_expr.typ().clone()),
         );
         let code = place_expr.assign(res, loc).with_location(loc);
-        Stmt::block(vec![len_decl, lhs_decl, rhs_decl, code], loc)
+        Stmt::block(
+            vec![
+                len_decl,
+                lhs_decl,
+                rhs_decl,
+                lhs_nonnull_check,
+                rhs_nonnull_check,
+                code,
+            ],
+            loc,
+        )
     }
 
     // In some contexts (e.g., compilation-time evaluation),
