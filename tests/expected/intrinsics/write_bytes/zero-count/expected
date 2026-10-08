@@ -1,0 +1,4 @@
+FAILURE\
+`dst` must be non-null
+FAILURE\
+`dst` must be properly aligned

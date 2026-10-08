@@ -1083,6 +1083,7 @@ impl GotocCtx<'_, '_> {
     ///     <https://doc.rust-lang.org/core/intrinsics/fn.copy_nonoverlapping.html>
     ///
     /// Undefined behavior if any of these conditions are violated:
+    ///  * Both `src`/`dst` must be non-null (done by non-null checks)
     ///  * Both `src`/`dst` must be properly aligned (done by alignment checks)
     ///  * Both `src`/`dst` must be valid for reads/writes of `count *
     ///      size_of::<T>()` bytes (done by calls to `memmove`)
@@ -1106,6 +1107,19 @@ impl GotocCtx<'_, '_> {
         // pointers or directly unwrap the `pointee_type` result as seen later.
         let src = fargs.remove(0).cast_to(Type::void_pointer());
         let dst = fargs.remove(0).cast_to(Type::void_pointer());
+
+        let src_nonnull_check = self.codegen_assert_assume(
+            src.clone().is_nonnull(),
+            PropertyClass::SafetyCheck,
+            "`src` must be non-null",
+            loc,
+        );
+        let dst_nonnull_check = self.codegen_assert_assume(
+            dst.clone().is_nonnull(),
+            PropertyClass::SafetyCheck,
+            "`dst` must be non-null",
+            loc,
+        );
 
         // Generate alignment checks for both pointers
         let src_align = self.is_ptr_aligned(farg_types[0], src.clone());
@@ -1146,7 +1160,17 @@ impl GotocCtx<'_, '_> {
         } else {
             copy_if_nontrivial.as_stmt(loc)
         };
-        Stmt::block(vec![src_align_check, dst_align_check, overflow_check, copy_expr], loc)
+        Stmt::block(
+            vec![
+                src_nonnull_check,
+                dst_nonnull_check,
+                src_align_check,
+                dst_align_check,
+                overflow_check,
+                copy_expr,
+            ],
+            loc,
+        )
     }
 
     /// This is an intrinsic that was added in
@@ -1867,6 +1891,7 @@ impl GotocCtx<'_, '_> {
     /// <https://doc.rust-lang.org/std/ptr/fn.write_bytes.html>
     ///
     /// Undefined behavior if any of these conditions are violated:
+    ///  * `dst` must be non-null (done by `nonnull_check` below)
     ///  * `dst` must be valid for writes (done by memset writable check)
     ///  * `dst` must be properly aligned (done by `align_check` below)
     ///
@@ -1891,6 +1916,12 @@ impl GotocCtx<'_, '_> {
             "`dst` must be properly aligned",
             loc,
         );
+        let nonnull_check = self.codegen_assert_assume(
+            dst.clone().is_nonnull(),
+            PropertyClass::SafetyCheck,
+            "`dst` must be non-null",
+            loc,
+        );
 
         // Check that computing `count` in bytes would not overflow
         let (count_bytes, overflow_check) = self.count_in_bytes(
@@ -1902,12 +1933,15 @@ impl GotocCtx<'_, '_> {
         );
 
         let memset_call = BuiltinFn::Memset.call(vec![dst, val, count_bytes], loc);
-        Stmt::if_then_else(
+        let write = Stmt::if_then_else(
             count.clone().gt(Expr::int_constant(0, count.typ().clone())),
-            Stmt::block(vec![align_check, overflow_check, memset_call.as_stmt(loc)], loc),
+            memset_call.as_stmt(loc),
             None,
             loc,
-        )
+        );
+        // `write_bytes` requires `dst` to be non-null and properly aligned even when `count` is
+        // zero. Only the actual memory write is conditional on a nonzero count.
+        Stmt::block(vec![nonnull_check, align_check, overflow_check, write], loc)
     }
 
     /// Computes (multiplies) the equivalent of a memory-related number (e.g., an offset) in bytes.
