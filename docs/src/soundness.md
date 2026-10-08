@@ -2,6 +2,63 @@
 
 This page documents Kani's soundness guarantees and known limitations.
 
+## Operational soundness contract
+
+For a particular harness and configuration, Kani is sound when the following
+implication holds:
+
+> If Kani reports `Success`, then every execution represented by the configured
+> Rust/MIR model, satisfying the harness's explicit assumptions, contracts, and
+> stubs, satisfies every checked property.
+
+The claim is conditional on the verification scope. In particular, a proof
+does not establish properties for values excluded by `kani::assume`, function
+contracts, verified or user-provided stubs, or other explicit preconditions.
+The same applies to a harness generated from a restricted input domain.
+
+Soundness here means no false negative: Kani must not report `Success` while a
+represented execution violates a checked property. Incompleteness and false
+positives are permitted. For example, Kani may reject a program because a
+construct is unsupported or because its model is more restrictive than Rust's
+semantics, but it must not silently omit a reachable execution and then report
+success.
+
+The contract assumes that:
+
+- `rustc` has produced a correct MIR representation of the selected target and
+  the target/platform ABI and layout model are the ones intended by the user;
+- CBMC, its solver, and Kani's serialization and result-processing pipeline
+  correctly implement the submitted verification conditions;
+- all loops and recursion are either completely unwound with their unwinding
+  assertions passing or are justified by a sound loop/recursion contract;
+- every reachable unsupported, undefined, or inconclusive condition is
+  reported as a failure or as an undetermined result, never as success; and
+- the user has not enabled a documented under-approximation or disabled a
+  required check.
+
+This contract is deliberately separate from completeness. A successful proof
+may still cover only one harness, one monomorphization, a bounded input size,
+or values reachable through a selected constructor.
+
+## Threat model and proof obligations
+
+The soundness-sensitive boundaries are:
+
+1. **Input and harness generation** must not exclude valid executions while
+   presenting the result as an unrestricted proof.
+2. **MIR transformation** must preserve behavior, except where an explicit
+   contract says that behavior is intentionally assumed or modeled.
+3. **Code generation and memory modeling** must over-approximate valid Rust
+   executions and must check the validity conditions for unsafe operations.
+4. **Unsupported features and backend failures** must remain visible and must
+   prevent a successful verdict.
+5. **Result processing** must reject incomplete, unknown, solver-error, and
+   otherwise inconclusive output.
+
+This threat model allows conservative modeling choices that cause false
+alarms. It does not allow assumptions that remove a valid failing execution
+from a proof without clearly changing the proof scope.
+
 ## What Kani Checks
 
 Kani automatically checks for the following classes of issues:
@@ -90,3 +147,26 @@ failures (false negatives). See
 If you believe Kani has failed to detect a genuine issue (false negative),
 please file a bug report with the `[F] Soundness` label at the
 [soundness issues tracker](https://github.com/model-checking/kani/issues?q=label%3A%22%5BF%5D+Soundness%22).
+
+### Intentional under-approximations
+
+Some opt-in workflows are explicitly narrower than the set of all executions
+of the source function. Their results must be read conditionally:
+
+- `kani autoharness --bounded-arguments` limits slice, string, and bounded
+  arbitrary inputs.
+- `kani autoharness --constructor-args` and mined invariants generate only
+  values reachable through a selected constructor or heuristic invariant.
+- Automatic harnesses may verify a selected generic instantiation rather than
+  all instantiations.
+- Stubs, contracts, `kani::assume`, and `--restrict-vtable` replace or exclude
+  behaviors according to their specifications.
+- Disabling unwinding assertions, default checks, or relevant safety checks
+  removes part of the stated proof obligation and must not be described as an
+  unrestricted sound proof.
+
+These modes may be useful and may be sound relative to their reduced
+assumption set, but they cannot establish the corresponding unrestricted
+property. In particular, an unsatisfiable assumption or constructor must not
+be allowed to turn an empty set of executions into an unconditional successful
+proof.
