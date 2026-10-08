@@ -1314,10 +1314,8 @@ impl GotocCtx<'_, '_> {
     // immediately returns zero when ZSTs are compared to mimic what compare_bytes and our memcmp
     // hook do.
     //
-    // TODO: It's UB to call `raw_eq` if any of the bytes in the first or second
-    // arguments are uninitialized. At present, we cannot detect if there is
-    // uninitialized memory, but `raw_eq` would basically return a nondet. value
-    // when one of the arguments is uninitialized.
+    // The optional uninitialized-memory pass inserts full-byte checks for this
+    // intrinsic, including padding bytes, before this implementation runs.
     // https://github.com/model-checking/kani/issues/920
     fn codegen_intrinsic_raw_eq(
         &mut self,

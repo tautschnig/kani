@@ -303,6 +303,14 @@ impl MirVisitor for CheckUninitVisitor {
                                     count: args[2].clone(),
                                 });
                             }
+                            Intrinsic::RawEq => {
+                                self.push_target(MemoryInitOp::CheckRawBytes {
+                                    operand: args[0].clone(),
+                                });
+                                self.push_target(MemoryInitOp::CheckRawBytes {
+                                    operand: args[1].clone(),
+                                });
+                            }
                             Intrinsic::Copy => {
                                 // The copy is untyped, so we should copy memory
                                 // initialization state from `src` to `dst`.
@@ -623,7 +631,6 @@ fn can_skip_intrinsic(intrinsic: Intrinsic) -> bool {
         | Intrinsic::PowF64
         | Intrinsic::PowIF32
         | Intrinsic::PowIF64
-        | Intrinsic::RawEq
         | Intrinsic::RotateLeft
         | Intrinsic::RotateRight
         | Intrinsic::RoundF32

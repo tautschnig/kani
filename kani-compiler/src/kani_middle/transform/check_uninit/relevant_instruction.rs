@@ -8,8 +8,11 @@ use crate::kani_middle::transform::body::{
     InsertPosition, MutableBody, SourceInstruction, synthetic_source_info,
 };
 use rustc_public::{
-    mir::{FieldIdx, Mutability, Operand, Place, RawPtrKind, Rvalue, Statement, StatementKind},
-    ty::{RigidTy, Ty},
+    mir::{
+        FieldIdx, Mutability, Operand, Place, ProjectionElem, RawPtrKind, Rvalue, Statement,
+        StatementKind,
+    },
+    ty::{RigidTy, Ty, TyKind},
 };
 use strum_macros::AsRefStr;
 
@@ -19,6 +22,9 @@ pub enum MemoryInitOp {
     /// Check memory initialization of data bytes in a memory region starting from the pointer
     /// `operand` and of length `sizeof(operand)` bytes.
     Check { operand: Operand },
+    /// Check memory initialization of every byte in a memory region starting from the pointer
+    /// `operand` and of length `sizeof(operand)` bytes, including padding bytes.
+    CheckRawBytes { operand: Operand },
     /// Set memory initialization state of data bytes in a memory region starting from the pointer
     /// `operand` and of length `sizeof(operand)` bytes.
     Set { operand: Operand, value: bool, position: InsertPosition },
@@ -67,6 +73,9 @@ impl MemoryInitOp {
             | MemoryInitOp::Set { operand, .. }
             | MemoryInitOp::CheckSliceChunk { operand, .. }
             | MemoryInitOp::SetSliceChunk { operand, .. } => operand.clone(),
+            MemoryInitOp::CheckRawBytes { operand } => {
+                mk_raw_ptr(operand, body, statements, source)
+            }
             MemoryInitOp::CheckRef { operand, .. }
             | MemoryInitOp::SetRef { operand, .. }
             | MemoryInitOp::CreateUnion { operand, .. }
@@ -116,6 +125,20 @@ impl MemoryInitOp {
             | MemoryInitOp::Set { operand, .. }
             | MemoryInitOp::CheckSliceChunk { operand, .. }
             | MemoryInitOp::SetSliceChunk { operand, .. } => operand.ty(body.locals()).unwrap(),
+            MemoryInitOp::CheckRawBytes { operand } => {
+                let operand_ty = operand.ty(body.locals()).unwrap();
+                if matches!(operand_ty.kind(), TyKind::RigidTy(RigidTy::Ref(..))) {
+                    let place = match operand {
+                        Operand::Copy(place) | Operand::Move(place) => place,
+                        Operand::Constant(_) | Operand::RuntimeChecks(_) => unreachable!(),
+                    };
+                    let mut pointee_place = place.clone();
+                    pointee_place.projection.push(ProjectionElem::Deref);
+                    Rvalue::AddressOf(RawPtrKind::Const, pointee_place).ty(body.locals()).unwrap()
+                } else {
+                    operand_ty
+                }
+            }
             MemoryInitOp::SetRef { operand, .. }
             | MemoryInitOp::CheckRef { operand, .. }
             | MemoryInitOp::CreateUnion { operand, .. }
@@ -161,6 +184,7 @@ impl MemoryInitOp {
             | MemoryInitOp::SetSliceChunk { count, .. }
             | MemoryInitOp::Copy { count, .. } => count.clone(),
             MemoryInitOp::Check { .. }
+            | MemoryInitOp::CheckRawBytes { .. }
             | MemoryInitOp::Set { .. }
             | MemoryInitOp::CheckRef { .. }
             | MemoryInitOp::SetRef { .. }
@@ -180,6 +204,7 @@ impl MemoryInitOp {
             | MemoryInitOp::SetRef { value, .. } => *value,
             MemoryInitOp::CreateUnion { .. } => true,
             MemoryInitOp::Check { .. }
+            | MemoryInitOp::CheckRawBytes { .. }
             | MemoryInitOp::CheckSliceChunk { .. }
             | MemoryInitOp::CheckRef { .. }
             | MemoryInitOp::Unsupported { .. }
@@ -195,6 +220,7 @@ impl MemoryInitOp {
         match self {
             MemoryInitOp::CreateUnion { field, .. } => Some(*field),
             MemoryInitOp::Check { .. }
+            | MemoryInitOp::CheckRawBytes { .. }
             | MemoryInitOp::CheckSliceChunk { .. }
             | MemoryInitOp::CheckRef { .. }
             | MemoryInitOp::Set { .. }
@@ -215,6 +241,7 @@ impl MemoryInitOp {
             | MemoryInitOp::SetSliceChunk { position, .. }
             | MemoryInitOp::SetRef { position, .. } => *position,
             MemoryInitOp::Check { .. }
+            | MemoryInitOp::CheckRawBytes { .. }
             | MemoryInitOp::CheckSliceChunk { .. }
             | MemoryInitOp::CheckRef { .. }
             | MemoryInitOp::Unsupported { .. }
@@ -285,4 +312,36 @@ fn mk_ref(
     };
 
     Operand::Copy(Place { local: ref_local, projection: vec![] })
+}
+
+/// Convert a reference operand to the raw pointer expected by the memory initialization models.
+/// Raw pointer operands already have the required representation and are returned unchanged.
+fn mk_raw_ptr(
+    operand: &Operand,
+    body: &mut MutableBody,
+    statements: &mut Vec<Statement>,
+    source: &mut SourceInstruction,
+) -> Operand {
+    let operand_ty = operand.ty(body.locals()).unwrap();
+    if !matches!(operand_ty.kind(), TyKind::RigidTy(RigidTy::Ref(..))) {
+        return operand.clone();
+    }
+
+    let place = match operand {
+        Operand::Copy(place) | Operand::Move(place) => place,
+        Operand::Constant(_) | Operand::RuntimeChecks(_) => unreachable!(),
+    };
+    let mut pointee_place = place.clone();
+    pointee_place.projection.push(ProjectionElem::Deref);
+    let rvalue = Rvalue::AddressOf(RawPtrKind::Const, pointee_place);
+    let ret_local = body.new_local(
+        rvalue.ty(body.locals()).unwrap(),
+        source.span(body.blocks()),
+        Mutability::Not,
+    );
+    statements.push(Statement {
+        kind: StatementKind::Assign(Place::from(ret_local), rvalue),
+        source_info: synthetic_source_info(source.span(body.blocks())),
+    });
+    Operand::Copy(Place::from(ret_local))
 }

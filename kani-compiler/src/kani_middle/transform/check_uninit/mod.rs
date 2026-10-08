@@ -206,6 +206,7 @@ impl<'a> UninitInstrumenter<'a> {
         match &operation {
             MemoryInitOp::CheckSliceChunk { .. }
             | MemoryInitOp::Check { .. }
+            | MemoryInitOp::CheckRawBytes { .. }
             | MemoryInitOp::CheckRef { .. } => {
                 self.build_get_and_check(body, source, operation, pointee_info)
             }
@@ -247,11 +248,22 @@ impl<'a> UninitInstrumenter<'a> {
         let ptr_operand = operation.mk_operand(body, &mut statements, source);
         let terminator = match pointee_info.layout() {
             PointeeLayout::Sized { layout } => {
-                let layout_operand = mk_layout_operand(body, &mut statements, source, layout);
+                // `raw_eq` has a stronger precondition than ordinary typed reads:
+                // padding bytes must be initialized as well. The memory-init model's
+                // layout mask normally marks padding as irrelevant, so use an
+                // all-bytes mask for this operation.
+                let layout_operand = if matches!(&operation, MemoryInitOp::CheckRawBytes { .. }) {
+                    let full_layout = vec![true; layout.len()];
+                    mk_layout_operand(body, &mut statements, source, &full_layout)
+                } else {
+                    mk_layout_operand(body, &mut statements, source, layout)
+                };
                 // Depending on whether accessing the known number of elements in the slice, need to
                 // pass is as an argument.
                 let (diagnostic, args) = match &operation {
-                    MemoryInitOp::Check { .. } | MemoryInitOp::CheckRef { .. } => {
+                    MemoryInitOp::Check { .. }
+                    | MemoryInitOp::CheckRawBytes { .. }
+                    | MemoryInitOp::CheckRef { .. } => {
                         let diagnostic = KANI_IS_PTR_INITIALIZED;
                         let args = vec![ptr_operand.clone(), layout_operand];
                         (diagnostic, args)
@@ -285,6 +297,11 @@ impl<'a> UninitInstrumenter<'a> {
                 }
             }
             PointeeLayout::Slice { element_layout } => {
+                if matches!(&operation, MemoryInitOp::CheckRawBytes { .. }) {
+                    let reason = "Kani does not support raw_eq on unsized values with uninitialized memory checks.";
+                    self.inject_unsupported_check(body, source, operation.position(), reason);
+                    return;
+                }
                 // Since `str`` is a separate type, need to differentiate between [T] and str.
                 let (slicee_ty, diagnostic) = match pointee_info.ty().kind() {
                     TyKind::RigidTy(RigidTy::Slice(slicee_ty)) => {
@@ -339,6 +356,7 @@ impl<'a> UninitInstrumenter<'a> {
         // basic block. Instead, we insert the check after the basic block.
         let operand_ty = match &operation {
             MemoryInitOp::Check { operand }
+            | MemoryInitOp::CheckRawBytes { operand }
             | MemoryInitOp::CheckSliceChunk { operand, .. }
             | MemoryInitOp::CheckRef { operand } => operand.ty(body.locals()).unwrap(),
             _ => unreachable!(),
