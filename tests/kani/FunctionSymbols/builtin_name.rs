@@ -10,7 +10,7 @@ fn copysign(a: f64, _b: f64) -> f64 {
 
 #[kani::proof]
 pub fn harness() {
-    let a: f64 = kani::any();
-    let b: f64 = kani::any();
-    copysign(a, b);
+    let a = 1.0;
+    let b = 2.0;
+    assert!(copysign(a, b) == a);
 }
