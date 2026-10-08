@@ -1081,21 +1081,21 @@ impl LoopContractPass {
                 == Some(Symbol::intern("kani_register_loop_contract"))
                 && matches!(
                     terminator_args.get(1),
-                    Some(Operand::Constant(op)) if op.const_.eval_target_usize().unwrap_or(usize::MAX) == 0
+                    Some(Operand::Constant(op)) if op.const_.eval_target_usize().unwrap_or(u64::MAX) == 0
                 )
             {
                 // Check if the MIR satisfy the assumptions of this transformation.
-                let Some(terminator_target) = *terminator_target else { return false };
+                let Some(target_block) = *terminator_target else { return false };
                 let Some(loop_termination_block_id) = new_body
                     .blocks()
-                    .get(terminator_target)
+                    .get(target_block)
                     .and_then(|block| block.terminator.successors().first().copied())
                 else {
                     return false;
                 };
-                if !new_body.blocks()[terminator_target].statements.is_empty()
+                if !new_body.blocks()[target_block].statements.is_empty()
                     || !matches!(
-                        new_body.blocks()[terminator_target].terminator.kind,
+                        new_body.blocks()[target_block].terminator.kind,
                         TerminatorKind::SwitchInt { .. }
                     )
                 {
@@ -1106,7 +1106,7 @@ impl LoopContractPass {
                     self.move_storagedead(new_body, loop_latch_id, loop_termination_block_id);
                 }
 
-                let Some(GenericArgKind::Type(arg_ty)) = genarg.0.first().copied() else {
+                let Some(GenericArgKind::Type(arg_ty)) = genarg.0.first() else {
                     return false;
                 };
                 let TyKind::RigidTy(RigidTy::Closure(_, genarg)) = arg_ty.kind() else {
@@ -1124,13 +1124,13 @@ impl LoopContractPass {
                         break;
                     }
                 }
-                let Some(GenericArgKind::Type(arg_ty)) = genarg.0.get(fnptrpos + 1).copied() else {
+                let Some(GenericArgKind::Type(arg_ty)) = genarg.0.get(fnptrpos + 1) else {
                     return false;
                 };
                 let TyKind::RigidTy(RigidTy::Tuple(args)) = arg_ty.kind() else { return false };
                 // Check if the invariant involves any local variable
                 if !args.is_empty() {
-                    let Some(ori_condition_bb_idx) = new_body.blocks()[terminator_target]
+                    let Some(ori_condition_bb_idx) = new_body.blocks()[target_block]
                         .terminator
                         .successors()
                         .get(1)
