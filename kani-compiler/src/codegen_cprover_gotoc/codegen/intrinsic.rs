@@ -1225,14 +1225,7 @@ impl GotocCtx<'_, '_> {
         );
         let code = place_expr.assign(res, loc).with_location(loc);
         Stmt::block(
-            vec![
-                len_decl,
-                lhs_decl,
-                rhs_decl,
-                lhs_nonnull_check,
-                rhs_nonnull_check,
-                code,
-            ],
+            vec![len_decl, lhs_decl, rhs_decl, lhs_nonnull_check, rhs_nonnull_check, code],
             loc,
         )
     }

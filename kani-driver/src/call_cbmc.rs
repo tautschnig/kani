@@ -26,8 +26,7 @@ use crate::coverage::cov_results::{CoverageRegion, CoverageTerm};
 use crate::session::KaniSession;
 use crate::util::render_command;
 
-const CONSTRUCTOR_REACHABILITY_MARKER: &str =
-    "KANI_AUTOMATIC_CONSTRUCTOR_REACHABILITY";
+const CONSTRUCTOR_REACHABILITY_MARKER: &str = "KANI_AUTOMATIC_CONSTRUCTOR_REACHABILITY";
 
 /// CBMC version and system information
 #[derive(Debug, Clone)]
@@ -539,10 +538,7 @@ fn cbmc_reported_prover_status_after_results(items: &[ParserItem]) -> bool {
     else {
         return false;
     };
-    items
-        .iter()
-        .skip(result_idx + 1)
-        .any(|item| matches!(item, ParserItem::ProverStatus { .. }))
+    items.iter().skip(result_idx + 1).any(|item| matches!(item, ParserItem::ProverStatus { .. }))
 }
 
 /// Whether an automatic constructor generated no reachable value.

@@ -119,8 +119,7 @@ impl AnyModels {
 /// produced. The driver treats an unsatisfiable instance of this marker as an
 /// error, since otherwise an assert-guarded constructor that rejects every
 /// nondeterministic argument would make its caller vacuous.
-pub const CONSTRUCTOR_REACHABILITY_MARKER: &str =
-    "KANI_AUTOMATIC_CONSTRUCTOR_REACHABILITY";
+pub const CONSTRUCTOR_REACHABILITY_MARKER: &str = "KANI_AUTOMATIC_CONSTRUCTOR_REACHABILITY";
 
 /// Generate `T::any()` implementations for `T`s that do not implement Arbitrary in source code.
 /// Currently limited to structs and enums.
@@ -1747,11 +1746,14 @@ impl AutomaticArbitraryPass {
             &cover,
             source,
             InsertPosition::Before,
-            vec![Operand::Constant(ConstOperand {
-                span,
-                user_ty: None,
-                const_: MirConst::from_bool(true),
-            }), marker],
+            vec![
+                Operand::Constant(ConstOperand {
+                    span,
+                    user_ty: None,
+                    const_: MirConst::from_bool(true),
+                }),
+                marker,
+            ],
             Place::from(unit_lcl),
         );
     }
