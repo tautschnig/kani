@@ -170,6 +170,11 @@ Some options and APIs intentionally change the model being verified:
   the actual target environment. A proof that depends on such a model is
   conditional on that model matching the deployment platform; replacing a
   system function with an overly precise stub can create false negatives.
+- `kanitool` attributes are compiler-internal implementation details, not
+  user-level assumptions. In particular, user-defined functions cannot acquire
+  Kani's check-disabling or trusted hook/intrinsic behavior merely by copying
+  an internal marker; malformed internal marker shapes are rejected or treated
+  conservatively.
 
 ## Reporting Soundness Issues
 
