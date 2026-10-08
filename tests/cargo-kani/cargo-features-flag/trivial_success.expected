@@ -1,1 +1,3 @@
-VERIFICATION:- SUCCESSFUL
+CBMC reported no verification properties
+VERIFICATION:- FAILED
+No verification obligation was checked, so Kani cannot report a successful proof.
