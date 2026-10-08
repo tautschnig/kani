@@ -1,0 +1,10 @@
+# Copyright Kani Contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+[package]
+name = "kani"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "kani"

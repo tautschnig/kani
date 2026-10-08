@@ -351,24 +351,33 @@ pub fn find_kani_functions() -> HashMap<KaniFunction, FnDef> {
         kani.extend(rustc_public::find_crates("core"));
     }
     debug!(?kani, "find_kani_functions");
-    let fns = kani
-        .into_iter()
-        .find_map(|krate| {
-            let kani_funcs: HashMap<_, _> = krate
-                .fn_defs()
-                .into_iter()
-                .filter_map(|fn_def| {
-                    KaniFunction::try_from(fn_def).ok().map(|kani_function| {
-                        debug!(?kani_function, ?fn_def, "Found kani function");
-                        (kani_function, fn_def)
-                    })
+    let mut fns = None;
+    for krate in kani {
+        let kani_funcs: HashMap<_, _> = krate
+            .fn_defs()
+            .into_iter()
+            .filter_map(|fn_def| {
+                KaniFunction::try_from(fn_def).ok().map(|kani_function| {
+                    debug!(?kani_function, ?fn_def, "Found kani function");
+                    (kani_function, fn_def)
                 })
-                .collect();
-            // All definitions should live in the same crate, so we can return the first one.
-            // If there are no definitions, return `None` to indicate that.
-            (!kani_funcs.is_empty()).then_some(kani_funcs)
-        })
-        .unwrap_or_default();
+            })
+            .collect();
+        if kani_funcs.is_empty() {
+            continue;
+        }
+        // A dependency can legally expose a crate whose library name is `kani`. Selecting the
+        // first crate with recognized markers would make the result depend on rustc's crate
+        // ordering, and a dependency that copied enough markers could replace Kani's models and
+        // hooks. Refuse to use any ambiguous set of definitions; a later diagnostic reports the
+        // missing Kani functions and fails closed.
+        if fns.is_some() {
+            tracing::error!("Found Kani functions in multiple crates named `kani`");
+            return HashMap::default();
+        }
+        fns = Some(kani_funcs);
+    }
+    let fns = fns.unwrap_or_default();
     if cfg!(debug_assertions) {
         validate_kani_functions(&fns);
     }
