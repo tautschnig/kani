@@ -33,6 +33,13 @@ mod valid_access {
         let str_ptr = String::new().as_str() as *const str;
         assert!(can_dereference(str_ptr));
     }
+
+    #[kani::proof]
+    pub fn check_null_empty_slice() {
+        let slice_ptr = std::ptr::slice_from_raw_parts(std::ptr::null::<u8>(), 0);
+        assert!(!can_dereference(slice_ptr));
+        assert!(!kani::mem::is_inbounds(slice_ptr));
+    }
 }
 
 mod invalid_access {

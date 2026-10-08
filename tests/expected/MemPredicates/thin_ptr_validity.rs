@@ -23,6 +23,13 @@ mod valid_access {
     }
 
     #[kani::proof]
+    pub fn check_null_zst() {
+        let null = std::ptr::null::<()>();
+        assert!(!can_dereference(null));
+        assert!(!kani::mem::is_inbounds(null));
+    }
+
+    #[kani::proof]
     pub fn check_valid_array() {
         let array = ['a', 'b', 'c'];
         assert!(can_dereference(&array));

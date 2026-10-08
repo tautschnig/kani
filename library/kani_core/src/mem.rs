@@ -169,9 +169,9 @@ macro_rules! kani_mem {
 
         /// Checks that `ptr` points to an allocation that can hold data of size calculated from `T`.
         ///
-        /// This function always returns `true` for ZSTs, since every pointer to a ZST is valid.
-        /// For non-ZSTs, this function will return `false` if `ptr` is null
-        /// or the size of the val pointed to exceeds `isize::MAX`.
+        /// This function returns `false` if `ptr` is null, including for ZSTs.
+        /// For non-ZSTs, it also returns `false` if the size of the val pointed
+        /// to exceeds `isize::MAX`.
         /// Otherwise, it will return `true` if and only if `ptr` points to allocated memory
         /// that can hold data of size calculated from `T`.
         /// Note that Kani does not support reasoning about pointers to unallocated memory,
@@ -184,10 +184,10 @@ macro_rules! kani_mem {
         pub fn is_inbounds<T: MetaSized>(ptr: *const T) -> bool {
             // If size overflows, then pointer cannot be inbounds.
             let Some(sz) = checked_size_of_raw(ptr) else { return false };
-            if sz == 0 {
-                true // ZST pointers are always valid including nullptr.
-            } else if ptr.is_null() {
+            if ptr.is_null() {
                 false
+            } else if sz == 0 {
+                true // Non-null ZST pointers are always in bounds.
             } else {
                 // Note that this branch can't be tested in concrete execution as `is_read_ok` needs to be
                 // stubbed.

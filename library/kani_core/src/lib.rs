@@ -88,9 +88,9 @@ macro_rules! kani_lib {
             //! Given the following validity rules provided in the Rust documentation:
             //! <https://doc.rust-lang.org/std/ptr/index.html> (accessed May 20th, 2025)
             //!
-            //! 1. For memory accesses of size zero, every pointer is valid, including the null pointer.
+            //! 1. For memory accesses of size zero, every non-null, properly aligned pointer is valid.
             //!    The following points are only concerned with non-zero-sized accesses.
-            //! 2. A null pointer is never valid.
+            //! 2. A null pointer is never valid, including for zero-sized accesses.
             //! 3. For a pointer to be valid, it is necessary, but not always sufficient, that the pointer
             //!    be dereferenceable: the memory range of the given size starting at the pointer must all be
             //!    within the bounds of a single allocated object. Note that in Rust, every (stack-allocated)
