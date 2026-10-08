@@ -76,7 +76,7 @@ impl TransformPass for IntrinsicGeneratorPass {
             .filter(|kani_intrinsic| {
                 self.kani_defs
                     .get(&(*kani_intrinsic).into())
-                    .is_some_and(|def| *def == instance.def)
+                    .is_some_and(|def| def.def_id() == instance.def.def_id())
             })
         {
             match kani_intrinsic {

@@ -1508,7 +1508,10 @@ impl GotocHooks {
         let fn_attr = attributes::fn_marker(instance.def);
         if let Some(ref fn_attr) = fn_attr
             && let Some(KaniFunction::Hook(hook)) = try_get_kani_function(fn_attr)
-            && self.kani_lib_hook_defs.get(&hook).is_some_and(|def| *def == instance.def)
+            && self
+                .kani_lib_hook_defs
+                .get(&hook)
+                .is_some_and(|def| def.def_id() == instance.def.def_id())
         {
             return Some(self.kani_lib_hooks[&hook].clone());
         }
