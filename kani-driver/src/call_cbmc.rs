@@ -227,10 +227,7 @@ impl KaniSession {
         cmd.args(args);
 
         let verification_results = if self.args.output_format() == crate::args::OutputFormat::Old {
-            match self.run_terminal_timeout(cmd) {
-                Ok(false) => VerificationResult::mock_success(),
-                Ok(true) | Err(_) => VerificationResult::mock_failure(),
-            }
+            old_format_verification_result(self.run_terminal_timeout(cmd))
         } else {
             // Add extra argument to receive the output in JSON format.
             // Done here because now removed `--visualize` used the XML format instead.
@@ -746,6 +743,17 @@ impl VerificationResult {
     }
 }
 
+/// Convert the terminal CBMC result used by the legacy output mode into a verification result.
+///
+/// `run_terminal_timeout` returns `Ok(true)` when the process timed out, so treating every `Ok`
+/// as success would turn a timeout into a false proof.
+fn old_format_verification_result(result: Result<bool>) -> VerificationResult {
+    match result {
+        Ok(false) => VerificationResult::mock_success(),
+        Ok(true) | Err(_) => VerificationResult::mock_failure(),
+    }
+}
+
 /// We decide if verification succeeded based on properties, not (typically) on exit code
 fn verification_outcome_from_properties(
     properties: &[Property],
@@ -1002,6 +1010,22 @@ mod tests {
         assert_eq!(result.status, VerificationStatus::Failure);
         assert!(matches!(result.failed_properties, FailedProperties::Error));
         assert!(result.results.is_ok());
+    }
+
+    #[test]
+    fn check_old_format_timeout_fails() {
+        assert_eq!(
+            old_format_verification_result(Ok(false)).status,
+            VerificationStatus::Success
+        );
+        assert_eq!(
+            old_format_verification_result(Ok(true)).status,
+            VerificationStatus::Failure
+        );
+        assert_eq!(
+            old_format_verification_result(Err(anyhow::anyhow!("CBMC failed"))).status,
+            VerificationStatus::Failure
+        );
     }
 
     /// When CBMC runs out of memory while writing its results, the result array it emitted is
