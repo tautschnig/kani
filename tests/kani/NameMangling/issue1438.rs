@@ -11,6 +11,10 @@
 pub fn main() {
     let first = test(0u8);
     let second = test(0u16);
+    drop((first, second));
+    let value: u8 = kani::any();
+    kani::assume(value < 10);
+    assert!(value < 10);
 }
 
 #[repr(C)]
