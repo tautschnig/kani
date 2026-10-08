@@ -422,8 +422,9 @@ impl<'tcx> KaniAttributes<'tcx> {
                     // Nothing to do here. This is used by contract instrumentation.
                 }
                 KaniAttributeKind::DisableChecks => {
-                    // Ignored here, because it should be an internal attribute. Actual validation
-                    // happens when pragmas are generated.
+                    // The compiler validates this attribute separately for all local items.
+                    // Keeping this arm is intentional: trusted Kani-generated code may carry
+                    // it, while user-local uses are rejected before code generation.
                 }
                 KaniAttributeKind::UseStubSet => {
                     // Validated when harness attributes are extracted.
@@ -435,6 +436,28 @@ impl<'tcx> KaniAttributes<'tcx> {
             }
         }
         (stub_verified_targets, contract_targets)
+    }
+
+    /// Reject internal check-disabling attributes in user code.
+    ///
+    /// `#[kanitool::disable_checks(...)]` is used by Kani's own memory-model
+    /// helpers to suppress CBMC's automatic checks around operations that Kani
+    /// models explicitly. If a user can apply it to an ordinary function, the
+    /// resulting pragma suppresses required safety checks and can turn a real
+    /// UB path into a successful proof.
+    pub fn check_disable_checks_attribute(&self, allow_internal: bool) {
+        if allow_internal {
+            return;
+        }
+        if let Some(attributes) = self.map.get(&KaniAttributeKind::DisableChecks) {
+            for attribute in attributes {
+                self.tcx.dcx().span_err(
+                    attribute.span(),
+                    "the internal `kanitool::disable_checks` attribute is not \
+                     permitted in user code",
+                );
+            }
+        }
     }
 
     /// Get the value of an attribute if one exists.

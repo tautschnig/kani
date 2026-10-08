@@ -271,7 +271,10 @@ impl Callbacks for KaniCompiler {
     ) -> Compilation {
         rustc_internal::run(tcx, || {
             let ignore_global_asm = QUERY_DB.with(|db| db.borrow().args().ignore_global_asm);
-            check_crate_items(tcx, ignore_global_asm);
+            let crate_name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).as_str();
+            let allow_internal_attributes =
+                self.build_std || crate_name == "kani";
+            check_crate_items(tcx, ignore_global_asm, allow_internal_attributes);
         })
         .unwrap();
         Compilation::Continue

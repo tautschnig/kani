@@ -17,7 +17,7 @@ use rustc_public::ty::{
     Ty, TyConst, TyKind,
 };
 use rustc_public::visitor::{Visitable, Visitor as TyVisitor};
-use rustc_public::{CrateDef, CrateDefType, DefId, local_crate};
+use rustc_public::{CrateDef, CrateDefType, DefId, all_local_items, local_crate};
 use std::ops::ControlFlow;
 
 use self::attributes::KaniAttributes;
@@ -83,10 +83,18 @@ pub mod transform;
 /// Check that all crate items are supported and there's no misconfiguration.
 /// This method will exhaustively print any error / warning and it will abort at the end if any
 /// error was found.
-pub fn check_crate_items(tcx: TyCtxt, ignore_asm: bool) {
+pub fn check_crate_items(tcx: TyCtxt, ignore_asm: bool, allow_internal_attributes: bool) {
     let krate = tcx.crate_name(LOCAL_CRATE);
     let mut all_stub_verified_targets = FxHashMap::default();
     let mut all_contract_targets = HashSet::new();
+
+    // Check every local item, including associated functions. `hir_free_items`
+    // below intentionally only covers crate-level items for the global-asm
+    // diagnostic, but internal Kani attributes can appear on methods as well.
+    for item in all_local_items() {
+        KaniAttributes::for_def_id(tcx, item.def_id())
+            .check_disable_checks_attribute(allow_internal_attributes);
+    }
 
     for item in tcx.hir_free_items() {
         let def_id = item.owner_id.def_id.to_def_id();
