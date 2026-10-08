@@ -87,6 +87,7 @@ pub fn check_crate_items(tcx: TyCtxt, ignore_asm: bool, allow_internal_attribute
     let krate = tcx.crate_name(LOCAL_CRATE);
     let mut all_stub_verified_targets = FxHashMap::default();
     let mut all_contract_targets = HashSet::new();
+    let trusted_macro_crates = trusted_kani_macro_crates(tcx);
 
     // Check every local item, including associated functions. `hir_free_items`
     // below intentionally only covers crate-level items for the global-asm
@@ -94,8 +95,9 @@ pub fn check_crate_items(tcx: TyCtxt, ignore_asm: bool, allow_internal_attribute
     for item in all_local_items() {
         let attributes = KaniAttributes::for_def_id(tcx, item.def_id());
         attributes.check_disable_checks_attribute(allow_internal_attributes);
-        attributes.check_internal_helper_marker(allow_internal_attributes);
-        attributes.check_internal_contract_attributes(allow_internal_attributes);
+        attributes.check_internal_helper_marker(allow_internal_attributes, &trusted_macro_crates);
+        attributes
+            .check_internal_contract_attributes(allow_internal_attributes, &trusted_macro_crates);
     }
 
     for item in tcx.hir_free_items() {
@@ -136,6 +138,33 @@ pub fn check_crate_items(tcx: TyCtxt, ignore_asm: bool, allow_internal_attribute
     }
 
     tcx.dcx().abort_if_errors();
+}
+
+/// Return the crate identities of Kani's proc-macro expansions.
+///
+/// Kani's macros are re-exported through the `kani` crate, so their expansion
+/// definition paths use the `kani::` prefix even though the defining crate is
+/// named `kani_macros`. Require both properties: either name alone can be
+/// claimed by a user-provided proc-macro crate. Collect the matching crate
+/// numbers from expanded local attributes and compare identities when
+/// validating internal attributes.
+fn trusted_kani_macro_crates(tcx: TyCtxt) -> HashSet<rustc_span::def_id::CrateNum> {
+    all_local_items()
+        .into_iter()
+        .flat_map(|item| {
+            #[allow(deprecated)]
+            tcx.get_all_attrs(rustc_public::rustc_internal::internal(tcx, item.def_id()))
+        })
+        .filter_map(|attribute| {
+            if attribute.is_parsed_attr() {
+                return None;
+            }
+            let def_id = attribute.span().ctxt().outer_expn().expn_data().macro_def_id?;
+            (tcx.crate_name(def_id.krate).as_str() == "kani_macros"
+                && tcx.def_path_str(def_id).starts_with("kani::"))
+            .then_some(def_id.krate)
+        })
+        .collect()
 }
 
 /// Whether `instance` is a C-variadic function whose calling convention is not the C one, e.g.

@@ -22,6 +22,7 @@ use rustc_public::rustc_internal;
 use rustc_public::ty::FnDef as FnDefStable;
 use rustc_public::{CrateDef, DefId as DefIdStable, Symbol as SymbolStable};
 use rustc_session::Session;
+use rustc_span::def_id::CrateNum;
 use rustc_span::{Span, Symbol};
 use std::str::FromStr;
 use strum_macros::{AsRefStr, EnumString};
@@ -465,7 +466,11 @@ impl<'tcx> KaniAttributes<'tcx> {
     /// These helpers are generated as nested items by Kani's procedural macros. A top-level
     /// user function carrying one of their markers can otherwise be mistaken for compiler
     /// instrumentation and have its body replaced or its checks suppressed.
-    pub fn check_internal_helper_marker(&self, allow_internal: bool) {
+    pub fn check_internal_helper_marker(
+        &self,
+        allow_internal: bool,
+        trusted_macro_crates: &HashSet<CrateNum>,
+    ) {
         if allow_internal {
             return;
         }
@@ -482,7 +487,7 @@ impl<'tcx> KaniAttributes<'tcx> {
             // Contract and loop macros emit these helper items through a proc-macro
             // expansion. A source-level copy has no expansion context and must not be
             // accepted as compiler instrumentation.
-            if !self.is_trusted_kani_macro_span(span) {
+            if !self.is_trusted_kani_macro_span(span, trusted_macro_crates) {
                 self.tcx.dcx().span_err(
                     span,
                     format!("the internal `{marker}` marker is not permitted in user code"),
@@ -497,7 +502,11 @@ impl<'tcx> KaniAttributes<'tcx> {
     /// function. A user-authored copy can make an ordinary function look like
     /// an instrumented contract and must not affect transformation or
     /// automatic-harness discovery.
-    pub fn check_internal_contract_attributes(&self, allow_internal: bool) {
+    pub fn check_internal_contract_attributes(
+        &self,
+        allow_internal: bool,
+        trusted_macro_crates: &HashSet<CrateNum>,
+    ) {
         if allow_internal {
             return;
         }
@@ -514,7 +523,7 @@ impl<'tcx> KaniAttributes<'tcx> {
             let Some(attributes) = self.map.get(&kind) else { continue };
             for attribute in attributes {
                 let span = attribute.span();
-                if !self.is_trusted_kani_macro_span(span) {
+                if !self.is_trusted_kani_macro_span(span, trusted_macro_crates) {
                     self.tcx.dcx().span_err(
                         span,
                         format!(
@@ -528,11 +537,15 @@ impl<'tcx> KaniAttributes<'tcx> {
     }
 
     /// Whether a span was produced by Kani's procedural macro crate.
-    fn is_trusted_kani_macro_span(&self, span: Span) -> bool {
+    fn is_trusted_kani_macro_span(
+        &self,
+        span: Span,
+        trusted_macro_crates: &HashSet<CrateNum>,
+    ) -> bool {
         let expn = span.ctxt().outer_expn();
         expn.expn_data()
             .macro_def_id
-            .is_some_and(|def_id| self.tcx.crate_name(def_id.krate).as_str() == "kani_macros")
+            .is_some_and(|def_id| trusted_macro_crates.contains(&def_id.krate))
     }
 
     /// Get the value of an attribute if one exists.
