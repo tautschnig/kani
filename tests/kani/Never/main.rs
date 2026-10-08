@@ -14,4 +14,8 @@ pub fn bar(infalliable: Infallible) -> i32 {
 
 // Give an empty main to make rustc happy.
 #[kani::proof]
-fn main() {}
+fn main() {
+    let value: u8 = kani::any();
+    kani::assume(value < 10);
+    assert!(value < 10);
+}
