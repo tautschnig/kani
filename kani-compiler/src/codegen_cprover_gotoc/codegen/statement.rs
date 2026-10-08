@@ -185,10 +185,14 @@ impl GotocCtx<'_, '_> {
                     return Stmt::skip(location);
                 }
                 // A zero-sized destination has no storage to update, but a
-                // right-hand side containing a raw zero-sized load still
-                // needs its alignment check.
+                // raw zero-sized access on either side still needs its
+                // alignment check. In particular, `ptr::write` lowers to an
+                // assignment whose destination is a raw-pointer dereference;
+                // omitting the destination check would accept a misaligned
+                // ZST write because there is no CBMC storage to update.
                 if self.is_zst_stable(lty) {
                     let mut places = Vec::new();
+                    places.push(lhs);
                     collect_rvalue_places(rhs, &mut places);
                     let checks = places
                         .into_iter()
