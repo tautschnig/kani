@@ -11,7 +11,9 @@
 use crate::codegen_cprover_gotoc::codegen::{PropertyClass, bb_label};
 use crate::codegen_cprover_gotoc::{GotocCtx, utils};
 use crate::kani_middle::attributes;
-use crate::kani_middle::kani_functions::{KaniFunction, KaniHook, try_get_kani_function};
+use crate::kani_middle::kani_functions::{
+    KaniFunction, KaniHook, KaniModel, try_get_kani_function,
+};
 use crate::unwrap_or_return_codegen_unimplemented_stmt;
 use cbmc::goto_program::CIntType;
 use cbmc::goto_program::Symbol as GotoSymbol;
@@ -22,7 +24,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{BasicBlockIdx, Place};
 use rustc_public::rustc_internal;
-use rustc_public::ty::ClosureKind;
+use rustc_public::ty::{ClosureKind, FnDef};
 use rustc_public::ty::RigidTy;
 use rustc_public::{CrateDef, ty::Span};
 use std::collections::HashMap;
@@ -403,7 +405,13 @@ impl GotocHook for Nondet {
     }
 }
 
-struct Panic;
+struct Panic {
+    /// The exact Kani model definition that stands in for rustc panic functions.
+    ///
+    /// `kanitool::fn_marker` is visible to user code, so the marker string alone is not
+    /// sufficient to authenticate this special case.
+    panic_stub_def: Option<FnDef>,
+}
 
 impl GotocHook for Panic {
     fn hook_applies(
@@ -411,13 +419,12 @@ impl GotocHook for Panic {
         tcx: TyCtxt,
         instance: Instance,
         instance_name: &str,
-        kani_tool_attr: Option<&String>,
+        _kani_tool_attr: Option<&String>,
     ) -> bool {
         let def_id = rustc_internal::internal(tcx, instance.def.def_id());
 
-        // we check the attributes to make sure this hook applies to
-        // panic functions we've stubbed too
-        kani_tool_attr.is_some_and(|kani| kani.contains("PanicStub"))
+        self.panic_stub_def
+            .is_some_and(|def| def.def_id() == instance.def.def_id())
             || Some(def_id) == tcx.lang_items().panic_fn()
             || tcx.is_lang_item(def_id, LangItem::PanicDisplay)
             || Some(def_id) == tcx.lang_items().panic_fmt()
@@ -1456,7 +1463,14 @@ pub fn fn_hooks(kani_functions: &HashMap<KaniFunction, rustc_public::ty::FnDef>)
         (KaniHook::SliceValidityAssume, Rc::new(SliceValidityAssume)),
         (KaniHook::Exists, Rc::new(Exists)),
         (KaniHook::Forall, Rc::new(Forall)),
-        (KaniHook::Panic, Rc::new(Panic)),
+        (
+            KaniHook::Panic,
+            Rc::new(Panic {
+                panic_stub_def: kani_functions
+                    .get(&KaniFunction::Model(KaniModel::PanicStub))
+                    .copied(),
+            }),
+        ),
         (KaniHook::Check, Rc::new(Check)),
         (KaniHook::Cover, Rc::new(Cover)),
         (KaniHook::AnyRaw, Rc::new(Nondet)),
@@ -1480,7 +1494,11 @@ pub fn fn_hooks(kani_functions: &HashMap<KaniFunction, rustc_public::ty::FnDef>)
             })
             .collect(),
         other_hooks: vec![
-            Rc::new(Panic),
+            Rc::new(Panic {
+                panic_stub_def: kani_functions
+                    .get(&KaniFunction::Model(KaniModel::PanicStub))
+                    .copied(),
+            }),
             Rc::new(RustAlloc),
             Rc::new(MemCmp),
             Rc::new(LoopInvariantRegister),
