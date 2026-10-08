@@ -193,7 +193,7 @@ prefetch_write_instruction | No | |
 ptr_guaranteed_eq | Yes | |
 ptr_guaranteed_ne | Yes | |
 ptr_offset_from | Partial | Doesn't check [all UB conditions](https://doc.rust-lang.org/std/primitive.pointer.html#safety-4) |
-raw_eq | Yes | |
+raw_eq | Partial | Uninitialized bytes are checked only with `-Z uninit-checks` |
 round_ties_even_f16 | No | |
 round_ties_even_f32 | Yes | |
 round_ties_even_f64 | Yes | |
