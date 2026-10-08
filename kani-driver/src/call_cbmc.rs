@@ -227,10 +227,9 @@ impl KaniSession {
         cmd.args(args);
 
         let verification_results = if self.args.output_format() == crate::args::OutputFormat::Old {
-            if self.run_terminal_timeout(cmd).is_err() {
-                VerificationResult::mock_failure()
-            } else {
-                VerificationResult::mock_success()
+            match self.run_terminal_timeout(cmd) {
+                Ok(false) => VerificationResult::mock_success(),
+                Ok(true) | Err(_) => VerificationResult::mock_failure(),
             }
         } else {
             // Add extra argument to receive the output in JSON format.
