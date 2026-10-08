@@ -389,7 +389,9 @@ impl<'a, 'tcx> Context<'a, 'tcx> {
             }
         };
         debug!("register_fun_decl_id: {:?}", self.id_map);
-        tid.try_into().unwrap()
+        self.convert_item_id(tid, def_id, "function", |translated| {
+            translated.fun_decls.reserve_slot()
+        })
     }
 
     fn register_type_decl_id(&mut self, def_id: DefId) -> CharonTypeDeclId {
@@ -404,7 +406,7 @@ impl<'a, 'tcx> Context<'a, 'tcx> {
             }
         };
         debug!("register_type_decl_id: {:?}", self.id_map);
-        tid.try_into().unwrap()
+        self.convert_item_id(tid, def_id, "type", |translated| translated.type_decls.reserve_slot())
     }
 
     fn register_trait_decl_id(&mut self, def_id: DefId) -> CharonTraitDeclId {
@@ -419,7 +421,9 @@ impl<'a, 'tcx> Context<'a, 'tcx> {
             }
         };
         debug!("register_trait_decl_id: {:?}", self.id_map);
-        tid.try_into().unwrap()
+        self.convert_item_id(tid, def_id, "trait declaration", |translated| {
+            translated.trait_decls.reserve_slot()
+        })
     }
 
     fn register_trait_impl_id(&mut self, def_id: DefId) -> CharonTraitImplId {
@@ -434,7 +438,9 @@ impl<'a, 'tcx> Context<'a, 'tcx> {
             }
         };
         debug!("register_trait_impl_id: {:?}", self.id_map);
-        tid.try_into().unwrap()
+        self.convert_item_id(tid, def_id, "trait implementation", |translated| {
+            translated.trait_impls.reserve_slot()
+        })
     }
 
     fn register_global_decl_id(&mut self, def_id: DefId) -> CharonGlobalDeclId {
@@ -449,7 +455,41 @@ impl<'a, 'tcx> Context<'a, 'tcx> {
             }
         };
         debug!("register_global_decl_id: {:?}", self.id_map);
-        tid.try_into().unwrap()
+        self.convert_item_id(tid, def_id, "global declaration", |translated| {
+            translated.global_decls.reserve_slot()
+        })
+    }
+
+    /// Convert a shared Rust definition ID into the Charon item-ID namespace.
+    ///
+    /// A definition ID should always be registered with the same Charon item
+    /// kind. If that invariant is violated, returning a fresh placeholder and
+    /// recording an error lets the caller finish translation far enough to
+    /// report a diagnostic instead of panicking in `TryInto`. The accumulated
+    /// Charon error prevents LLBC output from being emitted.
+    fn convert_item_id<T>(
+        &mut self,
+        item_id: CharonAnyTransId,
+        def_id: DefId,
+        expected_kind: &str,
+        reserve: impl FnOnce(&mut CharonTranslatedCrate) -> T,
+    ) -> T
+    where
+        T: TryFrom<CharonAnyTransId, Error = ()>,
+    {
+        match item_id.try_into() {
+            Ok(id) => id,
+            Err(()) => {
+                let span = self.translate_instance_span(self.instance);
+                register_error!(
+                    self,
+                    span,
+                    "LLBC item-kind mismatch for `{def_id:?}`: expected {expected_kind}, \
+                     found `{item_id:?}`"
+                );
+                reserve(self.translated)
+            }
+        }
     }
 
     // similar to register_type_decl_id, but not adding new def_id, used for cases where the def_id has been registered, or in functions that take immut &self
