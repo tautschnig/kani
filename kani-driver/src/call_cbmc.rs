@@ -1065,7 +1065,7 @@ mod tests {
 
         // An overall status that appeared before the result array cannot certify that the array
         // was complete.
-        let mut output = mock_cbmc_output(0, "SUCCESS", &[], Some("success"));
+        let mut output = mock_cbmc_output(0, "SUCCESS", &[], None);
         let early_status: ParserItem =
             serde_json::from_str(r#"{ "cProverStatus": "success" }"#).unwrap();
         output.processed_items.insert(0, early_status);
