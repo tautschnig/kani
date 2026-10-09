@@ -14,6 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Instant;
 use strum_macros::Display;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt};
@@ -135,10 +136,11 @@ impl KaniSession {
         run_terminal(&self.args.common_args, cmd)
     }
 
-    /// Call [run_terminal_timeout] with the verbosity configured by the user.
-    /// The `bool` value indicates whether the command timed out
-    pub fn run_terminal_timeout(&self, cmd: TokioCommand) -> Result<bool> {
-        self.runtime.block_on(run_terminal_timeout(
+    /// Call [run_terminal_timeout_captured] with the verbosity configured by the user.
+    /// The `bool` value indicates whether the command timed out, and the string contains the
+    /// command's captured standard output and standard error.
+    pub fn run_terminal_timeout_captured(&self, cmd: TokioCommand) -> Result<(bool, String)> {
+        self.runtime.block_on(run_terminal_timeout_captured(
             &self.args.common_args,
             cmd,
             self.args.harness_timeout,
@@ -200,47 +202,62 @@ pub fn run_terminal(verbosity: &impl Verbosity, mut cmd: Command) -> Result<()> 
     Ok(())
 }
 
-/// The `bool` value indicates whether the command timed out
-async fn run_terminal_timeout(
+/// The first value indicates whether the command timed out. The second value contains both
+/// standard output and standard error. Capturing the output lets callers that need the legacy
+/// terminal format still validate that CBMC actually generated verification conditions.
+async fn run_terminal_timeout_captured(
     verbosity: &impl Verbosity,
     mut cmd: TokioCommand,
     timeout: Option<Timeout>,
-) -> Result<bool> {
-    if verbosity.quiet() {
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-    }
+) -> Result<(bool, String)> {
     if verbosity.verbose() {
         println!("[Kani] Running: `{}`", render_command(cmd.as_std()).to_string_lossy());
     }
     let program = cmd.as_std().get_program().to_string_lossy().to_string();
-    let result = with_timer(
-        verbosity,
-        || async {
-            if let Some(timeout) = timeout {
-                let mut child = cmd.spawn().unwrap();
-                let res = tokio::time::timeout(timeout.into(), child.wait()).await;
-                if res.is_err() {
-                    // Kill the process
-                    child.kill().await.unwrap();
-                }
-                res
-            } else {
-                Ok(cmd.status().await)
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context(format!("Failed to invoke {program}"))?;
+    let mut stdout = child.stdout.take().context("CBMC stdout was not piped")?;
+    let mut stderr = child.stderr.take().context("CBMC stderr was not piped")?;
+    let stdout_reader = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).await.map(|_| output)
+    });
+    let stderr_reader = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).await.map(|_| output)
+    });
+
+    let (timed_out, result) = if let Some(timeout) = timeout {
+        match tokio::time::timeout(timeout.into(), child.wait()).await {
+            Ok(status) => (false, Some(status)),
+            Err(_) => {
+                // Kill the process, then reap it so that the output reader tasks can finish.
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                (true, None)
             }
-        },
-        &program,
-    )
-    .await;
-    // outer result indicates whether the command timed out
-    if result.is_err() {
-        return Ok(true);
+        }
+    } else {
+        (false, Some(child.wait().await))
+    };
+    let stdout = stdout_reader.await.context("CBMC stdout reader failed")??;
+    let stderr = stderr_reader.await.context("CBMC stderr reader failed")??;
+    if !verbosity.quiet() {
+        std::io::stdout().write_all(&stdout)?;
+        std::io::stderr().write_all(&stderr)?;
     }
-    let result = result.unwrap().context(format!("Failed to invoke {program}"))?;
+    let output = String::from_utf8_lossy(&stdout).into_owned() + &String::from_utf8_lossy(&stderr);
+    if timed_out {
+        return Ok((true, output));
+    }
+    let result = result.context("CBMC process did not return a status")??;
     if !result.success() {
         bail!("{} exited with status {}", cmd.as_std().get_program().to_string_lossy(), result);
     }
-    Ok(false)
+    Ok((false, output))
 }
 
 /// Run a job, but only output (unless --quiet) if it fails, and fail if there's a problem.

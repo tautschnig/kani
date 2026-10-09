@@ -1,7 +1,7 @@
 // Copyright Kani Contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use kani_metadata::{ArtifactType, HarnessKind, HarnessMetadata};
 use rayon::prelude::*;
 use std::fs::File;
@@ -371,6 +371,16 @@ impl KaniSession {
             && results.iter().all(|r| r.harness.is_automatically_generated)
         {
             return Err(crate::metadata::no_harness_match_error(&self.args.harnesses));
+        }
+
+        // A regular verification invocation with no harnesses checked is not a proof. Keep
+        // autoharness's "no eligible functions" workflow informational, but fail closed for
+        // ordinary `kani`/`cargo kani` invocations so wrappers cannot mistake an unchecked crate
+        // for a successful verification.
+        if results.is_empty() && self.autoharness_compiler_flags.is_none() {
+            return Err(anyhow!(
+                "No proof harnesses (functions with #[kani::proof]) were found to verify."
+            ));
         }
 
         let failing =

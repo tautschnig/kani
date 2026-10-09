@@ -225,13 +225,14 @@ impl KaniSession {
     /// Verify a goto binary that's been prepared with goto-instrument
     pub fn run_cbmc(&self, file: &Path, harness: &HarnessMetadata) -> Result<VerificationResult> {
         let args: Vec<OsString> = self.cbmc_flags(file, harness)?;
+        let diagnostic_mode = has_old_format_diagnostic_mode(&args);
 
         // TODO get cbmc path from self
         let mut cmd = TokioCommand::new("cbmc");
         cmd.args(args);
 
         let verification_results = if self.args.output_format() == crate::args::OutputFormat::Old {
-            old_format_verification_result(self.run_terminal_timeout(cmd))
+            old_format_verification_result(self.run_terminal_timeout_captured(cmd), diagnostic_mode)
         } else {
             // Add extra argument to receive the output in JSON format.
             // Done here because now removed `--visualize` used the XML format instead.
@@ -689,6 +690,19 @@ impl VerificationResult {
         }
     }
 
+    fn no_properties() -> VerificationResult {
+        VerificationResult {
+            status: VerificationStatus::Failure,
+            failed_properties: FailedProperties::Other,
+            results: Err(ExitStatus::NoProperties),
+            runtime: Duration::from_secs(0),
+            generated_concrete_test: false,
+            ignored_quantifiers: 0,
+            coverage_results: None,
+            cbmc_stats: None,
+        }
+    }
+
     fn mock_failure() -> VerificationResult {
         VerificationResult {
             status: VerificationStatus::Failure,
@@ -782,13 +796,52 @@ impl VerificationResult {
 
 /// Convert the terminal CBMC result used by the legacy output mode into a verification result.
 ///
-/// `run_terminal_timeout` returns `Ok(true)` when the process timed out, so treating every `Ok`
-/// as success would turn a timeout into a false proof.
-fn old_format_verification_result(result: Result<bool>) -> VerificationResult {
+/// The legacy output path does not have CBMC's structured result array. It must nevertheless
+/// verify that CBMC generated at least one verification condition; otherwise a harness with no
+/// assertions would be reported as a successful proof.
+fn old_format_verification_result(
+    result: Result<(bool, String)>,
+    diagnostic_mode: bool,
+) -> VerificationResult {
     match result {
-        Ok(false) => VerificationResult::mock_success(),
-        Ok(true) | Err(_) => VerificationResult::mock_failure(),
+        Ok((true, _)) | Err(_) => VerificationResult::mock_failure(),
+        Ok((false, output)) if output.contains("Generated 0 VCC(s),") => {
+            VerificationResult::no_properties()
+        }
+        // CBMC prints this status line for every completed verification. If it is absent, fail
+        // closed because the terminal output is not enough evidence for a successful proof. The
+        // diagnostic-only modes are the explicit exception: they intentionally do not perform
+        // verification and therefore do not emit a VCC summary.
+        Ok((false, output)) if !diagnostic_mode && !output.contains("Generated ") => {
+            VerificationResult::no_properties()
+        }
+        Ok((false, _)) => VerificationResult::mock_success(),
     }
+}
+
+/// CBMC's legacy terminal mode is also used for commands that inspect a GOTO program without
+/// running verification. These modes intentionally produce no VCC summary and must not be
+/// mistaken for an empty proof.
+fn has_old_format_diagnostic_mode(args: &[OsString]) -> bool {
+    const DIAGNOSTIC_OPTIONS: &[&str] = &[
+        "--export-symex-ready-goto",
+        "--list-goto-functions",
+        "--program-only",
+        "--show-byte-ops",
+        "--show-goto-functions",
+        "--show-goto-symex-steps",
+        "--show-loops",
+        "--show-parse-tree",
+        "--show-properties",
+        "--show-symex-strategies",
+        "--show-symbol-table",
+        "--show-test-suite",
+    ];
+
+    args.iter().filter_map(|arg| arg.to_str()).any(|arg| {
+        let option = arg.split_once('=').map_or(arg, |(option, _)| option);
+        DIAGNOSTIC_OPTIONS.contains(&option)
+    })
 }
 
 /// We decide if verification succeeded based on properties, not (typically) on exit code
@@ -1051,12 +1104,48 @@ mod tests {
 
     #[test]
     fn check_old_format_timeout_fails() {
-        assert_eq!(old_format_verification_result(Ok(false)).status, VerificationStatus::Success);
-        assert_eq!(old_format_verification_result(Ok(true)).status, VerificationStatus::Failure);
         assert_eq!(
-            old_format_verification_result(Err(anyhow::anyhow!("CBMC failed"))).status,
+            old_format_verification_result(
+                Ok((false, "Generated 1 VCC(s), 1 remaining after simplification".into())),
+                false,
+            )
+            .status,
+            VerificationStatus::Success
+        );
+        assert_eq!(
+            old_format_verification_result(Ok((true, String::new())), false).status,
             VerificationStatus::Failure
         );
+        assert_eq!(
+            old_format_verification_result(Err(anyhow::anyhow!("CBMC failed")), false).status,
+            VerificationStatus::Failure
+        );
+    }
+
+    #[test]
+    fn check_old_format_without_properties_fails() {
+        let result = old_format_verification_result(
+            Ok((false, "Generated 0 VCC(s), 0 remaining after simplification".into())),
+            false,
+        );
+        assert_eq!(result.status, VerificationStatus::Failure);
+        assert!(matches!(result.results, Err(ExitStatus::NoProperties)));
+
+        let result = old_format_verification_result(Ok((false, String::new())), false);
+        assert_eq!(result.status, VerificationStatus::Failure);
+        assert!(matches!(result.results, Err(ExitStatus::NoProperties)));
+    }
+
+    #[test]
+    fn check_old_format_diagnostic_mode_without_properties_succeeds() {
+        let result = old_format_verification_result(Ok((false, String::new())), true);
+        assert_eq!(result.status, VerificationStatus::Success);
+    }
+
+    #[test]
+    fn check_old_format_diagnostic_mode_detection() {
+        assert!(has_old_format_diagnostic_mode(&["--show-loops".into(), "model.goto".into(),]));
+        assert!(!has_old_format_diagnostic_mode(&["--trace".into(), "model.goto".into()]));
     }
 
     /// When CBMC runs out of memory while writing its results, the result array it emitted is

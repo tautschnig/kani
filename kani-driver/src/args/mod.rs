@@ -929,9 +929,8 @@ impl ValidateArgs for VerificationArgs {
                     "Conflicting options: --sarif isn't compatible with --output-format=old.",
                 ));
             }
-            // `--output-format=old` bypasses CBMC's structured output entirely: `run_cbmc` mocks a
-            // result with no properties, and treats a timeout as success. An export produced from
-            // that would be indistinguishable from a real clean run.
+            // `--output-format=old` bypasses CBMC's structured output entirely. An export produced
+            // from that terminal-only result would be indistinguishable from a real clean run.
             if self.export_json.is_some() && self.output_format() == OutputFormat::Old {
                 return Err(Error::raw(
                     ErrorKind::ArgumentConflict,

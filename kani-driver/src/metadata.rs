@@ -5,7 +5,8 @@ use anyhow::Result;
 use std::path::Path;
 
 use kani_metadata::{
-    HarnessMetadata, InternedString, TraitDefinedMethod, VtableCtxResults, find_proof_harnesses,
+    CallSite, HarnessMetadata, InternedString, PossibleMethodEntry, TraitDefinedMethod,
+    VtableCtxResults, find_proof_harnesses,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
@@ -53,8 +54,13 @@ fn link_function_pointer_restrictions(
         HashMap::new();
     for crate_data in &data_per_crate {
         for entry in &crate_data.possible_methods {
-            combined_possible_methods
-                .insert(entry.trait_method.clone(), entry.possibilities.clone());
+            let possibilities =
+                combined_possible_methods.entry(entry.trait_method.clone()).or_default();
+            for possibility in &entry.possibilities {
+                if !possibilities.contains(possibility) {
+                    possibilities.push(possibility.clone());
+                }
+            }
         }
     }
 
@@ -67,10 +73,14 @@ fn link_function_pointer_restrictions(
             let cbmc_call_site_name = format!("{}.{}", call_site.function_name, call_site.label);
             let trait_def = call_site.trait_method;
 
-            // Look up all possibilities, defaulting to the empty set
-            let possibilities =
-                combined_possible_methods.get(&trait_def).unwrap_or(&vec![]).clone();
-            output.insert(cbmc_call_site_name, possibilities);
+            // Missing or empty metadata must not become an empty restriction: that would
+            // eliminate every valid target and make the analysis unsound. Leave such call sites
+            // unrestricted so CBMC keeps its conservative function-pointer model.
+            if let Some(possibilities) = combined_possible_methods.get(&trait_def)
+                && !possibilities.is_empty()
+            {
+                output.insert(cbmc_call_site_name, possibilities.clone());
+            }
         }
     }
 
@@ -268,5 +278,44 @@ pub mod tests {
             .mangled_name,
             "module::not_check_three"
         );
+    }
+
+    #[test]
+    fn check_link_vtable_restrictions_unions_linked_crates() {
+        let trait_method = TraitDefinedMethod { trait_name: "Trait".into(), vtable_idx: 1 };
+        let call_site = CallSite {
+            trait_method: trait_method.clone(),
+            function_name: "caller".into(),
+            label: "restricted_call_label_1".into(),
+        };
+        let unrestricted_call_site = CallSite {
+            trait_method: TraitDefinedMethod { trait_name: "MissingTrait".into(), vtable_idx: 0 },
+            function_name: "caller".into(),
+            label: "restricted_call_label_2".into(),
+        };
+        let data_per_crate = vec![
+            VtableCtxResults {
+                call_sites: vec![call_site, unrestricted_call_site],
+                possible_methods: vec![PossibleMethodEntry {
+                    trait_method: trait_method.clone(),
+                    possibilities: vec!["impl_a".into()],
+                }],
+            },
+            VtableCtxResults {
+                call_sites: vec![],
+                possible_methods: vec![PossibleMethodEntry {
+                    trait_method,
+                    possibilities: vec!["impl_b".into()],
+                }],
+            },
+        ];
+        let output_file = tempfile::NamedTempFile::new().unwrap();
+
+        link_function_pointer_restrictions(data_per_crate, output_file.path()).unwrap();
+
+        let linked: HashMap<String, Vec<InternedString>> = from_json(output_file.path()).unwrap();
+        let expected: Vec<InternedString> = vec!["impl_a".into(), "impl_b".into()];
+        assert_eq!(linked.get("caller.restricted_call_label_1").unwrap(), &expected);
+        assert!(!linked.contains_key("caller.restricted_call_label_2"));
     }
 }
