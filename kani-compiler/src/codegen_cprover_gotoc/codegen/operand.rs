@@ -41,6 +41,16 @@ impl<'tcx, 'r> GotocCtx<'tcx, 'r> {
             // TODO: move is an opportunity to poison/nondet the original memory.
             {
                 let loc = Location::none();
+                let operand_ty = self.operand_ty_stable(operand);
+                if self.raw_pointer_load_requires_validity_check(place, operand_ty) {
+                    let result_type = self.codegen_ty_stable(operand_ty);
+                    return self.codegen_unimplemented_expr(
+                        "raw pointer load of a validity-restricted type",
+                        result_type,
+                        loc,
+                        "https://github.com/model-checking/kani/issues/920",
+                    );
+                }
                 if let Some(alignment_check) =
                     self.codegen_zst_raw_ptr_deref_alignment_check(place, loc)
                 {

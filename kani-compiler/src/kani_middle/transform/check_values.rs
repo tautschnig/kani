@@ -482,6 +482,41 @@ impl MirVisitor for CheckValueVisitor<'_, '_> {
                                 }),
                             }
                         }
+                        Some(
+                            "copy"
+                            | "volatile_copy_memory"
+                            | "volatile_copy_nonoverlapping_memory"
+                            | "volatile_load"
+                            | "unaligned_volatile_load",
+                        ) => {
+                            // These operations can create a typed value from bytes whose
+                            // validity is not tracked by this pass. A copy can subsequently be
+                            // read through its typed pointer, while a volatile load creates the
+                            // typed value immediately. Accepting either without tracking
+                            // validity could hide invalid values (for example, byte 2 copied or
+                            // loaded into a `bool`). The uninitialized-memory pass tracks
+                            // initialization separately, but it cannot establish type validity.
+                            // Fail closed until validity-aware byte tracking is available.
+                            let name = intrinsic_name(self.locals, func);
+                            let target_arg =
+                                if name.as_deref() == Some("copy") { &args[1] } else { &args[0] };
+                            let TyKind::RigidTy(RigidTy::RawPtr(target_ty, _)) =
+                                target_arg.ty(self.locals).unwrap().kind()
+                            else {
+                                unreachable!("typed byte operation should use a raw pointer");
+                            };
+                            self.push_target(SourceOp::UnsupportedCheck {
+                                check: if matches!(
+                                    name.as_deref(),
+                                    Some("volatile_load" | "unaligned_volatile_load")
+                                ) {
+                                    "typed volatile load".to_string()
+                                } else {
+                                    "typed copy".to_string()
+                                },
+                                ty: target_ty,
+                            });
+                        }
                         Some("transmute") | Some("transmute_copy") => {
                             unreachable!("Should've been lowered")
                         }

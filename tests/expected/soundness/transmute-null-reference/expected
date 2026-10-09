@@ -1,0 +1,3 @@
+transmute_null_pointer_to_reference_is_not_valid.unsupported_construct.\
+	 - Status: FAILURE\
+	 - Description: "transmute to a reference is not currently supported by Kani. Please post your example at https://github.com/model-checking/kani/issues/920"

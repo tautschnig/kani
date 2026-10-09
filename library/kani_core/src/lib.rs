@@ -730,10 +730,11 @@ macro_rules! kani_intrinsics {
             #[kanitool::fn_marker = "WriteAnyStrModel"]
             #[inline(always)]
             pub unsafe fn write_any_str(_s: *mut str) {
-                //TODO: strings introduce new UB
-                //(*s).as_bytes_mut().fill_with(u8::any)
-                //TODO: String validation
-                unimplemented!("Kani does not support creating arbitrary `str`")
+                // This is an unsupported model operation, rather than an ordinary panic:
+                // `--prove-safety-only` deliberately turns ordinary assertions into
+                // assumptions, but it must not turn an unsupported contract havoc operation
+                // into a successful proof.
+                super::unsupported("Kani does not support creating arbitrary `str`")
             }
 
             /// Function that calls a closure used to implement contracts.

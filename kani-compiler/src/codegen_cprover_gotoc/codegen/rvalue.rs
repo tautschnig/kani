@@ -10,6 +10,7 @@ use crate::kani_middle::abi::LayoutOf;
 use crate::kani_middle::coercion::{
     CoerceUnsizedInfo, CoerceUnsizedIterator, CoercionBaseStable, extract_unsize_casting_stable,
 };
+use crate::kani_middle::transform::check_values::ty_validity_per_offset;
 use crate::unwrap_or_return_codegen_unimplemented;
 use cbmc::MachineModel;
 use cbmc::goto_program::{
@@ -23,17 +24,171 @@ use rustc_middle::ty::{TyCtxt, VtblEntry};
 use rustc_public::abi::{Primitive, Scalar, ValueRepr};
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
-    AggregateKind, BinOp, CastKind, Operand, Place, PointerCoercion, Rvalue, UnOp,
+    AggregateKind, BinOp, CastKind, Mutability, Operand, Place, PointerCoercion, ProjectionElem,
+    Rvalue, UnOp,
 };
-use rustc_public::rustc_internal;
+use rustc_public::target::MachineInfo;
 use rustc_public::ty::{
     Binder, ClosureKind, ExistentialPredicate, FloatTy, IntTy, RigidTy, Size, Ty, TyConst, TyKind,
     UintTy, VariantIdx,
 };
+use rustc_public::{CrateDefType, rustc_internal};
 use std::collections::BTreeMap;
 use tracing::{debug, trace, warn};
 
 impl GotocCtx<'_, '_> {
+    /// Whether a destination type has validity restrictions that a plain bitcast
+    /// cannot establish. Transmuting into such a type is UB for some source
+    /// bit patterns, even if the value is never subsequently used.
+    ///
+    /// If the classifier cannot describe the type, fail closed as well: silently
+    /// accepting an unclassified validity invariant would make the transmute
+    /// model an unsound under-approximation.
+    pub(crate) fn transmute_destination_requires_validity_check(&self, ty: Ty) -> bool {
+        match ty_validity_per_offset(self.tcx, &MachineInfo::target(), ty, 0) {
+            Ok(ranges) => !ranges.is_empty(),
+            Err(_) => true,
+        }
+    }
+
+    /// A mutable raw-pointer cast can erase a validity restriction from the
+    /// pointer's pointee type. If the resulting pointer is used by a byte-copy
+    /// operation, the copy can write an invalid representation into the
+    /// original object and a later typed read may otherwise go unchecked.
+    fn mutable_pointer_cast_requires_validity_check(&self, src_ty: Ty, dst_ty: Ty) -> bool {
+        let TyKind::RigidTy(RigidTy::RawPtr(src_pointee, _)) = src_ty.kind() else {
+            return false;
+        };
+        let TyKind::RigidTy(RigidTy::RawPtr(dst_pointee, Mutability::Mut)) = dst_ty.kind() else {
+            return false;
+        };
+
+        if dst_pointee.kind().is_unit() {
+            return false;
+        }
+        if src_pointee.kind().is_unit() {
+            return true;
+        }
+
+        match (
+            ty_validity_per_offset(self.tcx, &MachineInfo::target(), src_pointee, 0),
+            ty_validity_per_offset(self.tcx, &MachineInfo::target(), dst_pointee, 0),
+        ) {
+            (Ok(src_ranges), Ok(dst_ranges)) => !src_ranges.is_empty() && src_ranges != dst_ranges,
+            _ => true,
+        }
+    }
+
+    fn integer_to_mutable_pointer_requires_validity_check(&self, dst_ty: Ty) -> bool {
+        matches!(dst_ty.kind(), TyKind::RigidTy(RigidTy::RawPtr(_, Mutability::Mut)))
+    }
+
+    pub(crate) fn transmute_contains_pointer_reinterpretation(
+        &self,
+        src_ty: Ty,
+        dst_ty: Ty,
+    ) -> bool {
+        if src_ty == dst_ty {
+            return false;
+        }
+
+        if self.mutable_pointer_cast_requires_validity_check(src_ty, dst_ty) {
+            return true;
+        }
+
+        // A pointer-containing destination may hide a reference or function
+        // pointer behind an enum/struct niche. If the complete destination
+        // type is not identical to the source, reject the transmute before
+        // attempting shape-based recursion; otherwise scalar-to-wrapper
+        // casts such as `usize -> Option<&T>` can erase pointer validity.
+        if self.type_contains_pointer_like(dst_ty) {
+            return true;
+        }
+
+        match (src_ty.kind(), dst_ty.kind()) {
+            (
+                TyKind::RigidTy(RigidTy::RawPtr(..) | RigidTy::Ref(..)),
+                TyKind::RigidTy(RigidTy::RawPtr(..) | RigidTy::Ref(..)),
+            ) => true,
+            (
+                TyKind::RigidTy(RigidTy::Adt(src_def, src_args)),
+                TyKind::RigidTy(RigidTy::Adt(dst_def, dst_args)),
+            ) => {
+                let src_variants = src_def.variants_iter().collect::<Vec<_>>();
+                let dst_variants = dst_def.variants_iter().collect::<Vec<_>>();
+                if src_variants.len() != dst_variants.len() {
+                    return self.type_contains_pointer_like(src_ty)
+                        || self.type_contains_pointer_like(dst_ty);
+                }
+                src_variants.iter().zip(dst_variants.iter()).any(|(src, dst)| {
+                    let src_fields = src.fields();
+                    let dst_fields = dst.fields();
+                    if src_fields.len() != dst_fields.len() {
+                        return self.type_contains_pointer_like(src_ty)
+                            || self.type_contains_pointer_like(dst_ty);
+                    }
+                    src_fields.iter().zip(dst_fields.iter()).any(|(src, dst)| {
+                        self.transmute_contains_pointer_reinterpretation(
+                            src.ty_with_args(&src_args),
+                            dst.ty_with_args(&dst_args),
+                        )
+                    })
+                })
+            }
+            (
+                TyKind::RigidTy(RigidTy::Tuple(src_types)),
+                TyKind::RigidTy(RigidTy::Tuple(dst_types)),
+            ) => src_types
+                .iter()
+                .zip(dst_types.iter())
+                .any(|(src, dst)| self.transmute_contains_pointer_reinterpretation(*src, *dst)),
+            (
+                TyKind::RigidTy(RigidTy::Array(src_ty, _)),
+                TyKind::RigidTy(RigidTy::Array(dst_ty, _)),
+            ) => self.transmute_contains_pointer_reinterpretation(src_ty, dst_ty),
+            // A scalar or otherwise differently-shaped source can still be
+            // reinterpreted as a pointer-containing wrapper, for example
+            // `usize` or `*const T` into `Option<&T>`. The wrapper's niche
+            // may make every bit pattern look like a valid discriminant while
+            // the contained reference remains invalid. Reject such casts
+            // conservatively instead of allowing the pointer invariant to be
+            // erased by the wrapper.
+            _ => self.type_contains_pointer_like(dst_ty),
+        }
+    }
+
+    fn type_contains_pointer_like(&self, ty: Ty) -> bool {
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::RawPtr(..) | RigidTy::Ref(..) | RigidTy::FnPtr(..)) => true,
+            TyKind::RigidTy(RigidTy::Pat(base_ty, _)) => self.type_contains_pointer_like(base_ty),
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => def
+                .variants_iter()
+                .flat_map(|variant| variant.fields())
+                .any(|field| self.type_contains_pointer_like(field.ty_with_args(&args))),
+            TyKind::RigidTy(RigidTy::Tuple(types)) => {
+                types.iter().any(|ty| self.type_contains_pointer_like(*ty))
+            }
+            TyKind::RigidTy(RigidTy::Array(ty, _)) => self.type_contains_pointer_like(ty),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn raw_pointer_load_requires_validity_check(&self, place: &Place, ty: Ty) -> bool {
+        // A raw-pointer dereference may be followed by field/index projections
+        // before MIR materializes the loaded value. For example,
+        // `(*ptr.cast::<Pair>()).boolean` reads a `bool` without having a
+        // final `Deref` projection. Do not lose the validity requirement merely
+        // because the projection selects a subfield.
+        place.projection.iter().enumerate().any(|(idx, projection)| {
+            if !matches!(projection, ProjectionElem::Deref) {
+                return false;
+            }
+            let pointer_place =
+                Place { local: place.local, projection: place.projection[..idx].to_vec() };
+            self.place_ty_stable(&pointer_place).kind().is_raw_ptr()
+        }) && self.transmute_destination_requires_validity_check(ty)
+    }
+
     fn codegen_comparison(&mut self, op: &BinOp, e1: &Operand, e2: &Operand) -> Expr {
         let left_op = self.codegen_operand_stable(e1);
         let right_op = self.codegen_operand_stable(e2);
@@ -586,7 +741,18 @@ impl GotocCtx<'_, '_> {
                         // index can never be constructed. Generic code might still try
                         // to initialize the non-existing invariant.
                         trace!(?res_ty, ?variant_index, "Unreachable invariant");
-                        return Expr::nondet(typ);
+                        return Expr::statement_expression(
+                            vec![
+                                self.codegen_assert_assume_false(
+                                    PropertyClass::Unreachable,
+                                    "aggregate expression for an unreachable enum variant",
+                                    loc,
+                                ),
+                                Expr::nondet(typ.clone()).as_stmt(loc),
+                            ],
+                            typ,
+                            loc,
+                        );
                     }
                     &layout.fields
                 }
@@ -773,7 +939,34 @@ impl GotocCtx<'_, '_> {
         let res_ty = self.rvalue_ty_stable(rv);
         debug!(?rv, ?res_ty, "codegen_rvalue");
         match rv {
-            Rvalue::Use(p, _) => self.codegen_operand_stable(p),
+            Rvalue::Use(p, _) => {
+                let operand_ty = p.ty(self.current_fn().locals()).unwrap();
+                if operand_ty != res_ty
+                    && !operand_ty.kind().is_fn()
+                    && self.type_contains_pointer_like(res_ty)
+                {
+                    let result_type = self.codegen_ty_stable(res_ty);
+                    return self.codegen_unimplemented_expr(
+                        "transmute containing pointer type reinterpretation",
+                        result_type,
+                        loc,
+                        "https://github.com/model-checking/kani/issues/920",
+                    );
+                }
+                if let Operand::Copy(place) | Operand::Move(place) = p
+                    && self.raw_pointer_load_requires_validity_check(place, res_ty)
+                {
+                    let result_type = self.codegen_ty_stable(res_ty);
+                    self.codegen_unimplemented_expr(
+                        "raw pointer load of a validity-restricted type",
+                        result_type,
+                        loc,
+                        "https://github.com/model-checking/kani/issues/920",
+                    )
+                } else {
+                    self.codegen_operand_stable(p)
+                }
+            }
             // `Reborrow` is the new user-definable reborrowing of ADTs (`CoerceShared`). It is
             // documented as a bitwise copy today, but the same docs anticipate it changing memory
             // layout, so report it as unsupported rather than silently modelling it as a copy.
@@ -787,7 +980,40 @@ impl GotocCtx<'_, '_> {
                 )
             }
             Rvalue::Repeat(op, sz) => self.codegen_rvalue_repeat(op, sz, loc),
-            Rvalue::Ref(_, _, p) | Rvalue::AddressOf(_, p) => {
+            Rvalue::Ref(_, _, p) => {
+                let place_ty = self.place_ty_stable(p);
+                if self.raw_pointer_load_requires_validity_check(p, place_ty) {
+                    let reference_type = self.codegen_ty_ref_stable(place_ty);
+                    return self.codegen_unimplemented_expr(
+                        "raw pointer load of a validity-restricted type",
+                        reference_type,
+                        loc,
+                        "https://github.com/model-checking/kani/issues/920",
+                    );
+                }
+                let place_ref = self.codegen_place_ref_stable(p, loc);
+                let place_ref_type = place_ref.typ().clone();
+                match self.codegen_raw_ptr_deref_validity_check(
+                    p,
+                    place_ref.clone(),
+                    place_ty,
+                    &loc,
+                ) {
+                    Some((ptr_alignment_check_expr, ptr_validity_check_expr)) => {
+                        Expr::statement_expression(
+                            vec![
+                                ptr_alignment_check_expr,
+                                ptr_validity_check_expr,
+                                place_ref.as_stmt(loc),
+                            ],
+                            place_ref_type,
+                            loc,
+                        )
+                    }
+                    None => place_ref,
+                }
+            }
+            Rvalue::AddressOf(_, p) => {
                 let place_ref = self.codegen_place_ref_stable(p, loc);
                 let place_ref_type = place_ref.typ().clone();
                 match self.codegen_raw_ptr_deref_validity_check(
@@ -824,7 +1050,32 @@ impl GotocCtx<'_, '_> {
                 | CastKind::PointerWithExposedProvenance,
                 e,
                 t,
-            ) => self.codegen_misc_cast(e, *t),
+            ) => {
+                if matches!(rv, Rvalue::Cast(CastKind::PointerWithExposedProvenance, ..))
+                    && self.integer_to_mutable_pointer_requires_validity_check(*t)
+                {
+                    let result_type = self.codegen_ty_stable(*t);
+                    self.codegen_unimplemented_expr(
+                        "integer-to-mutable raw-pointer cast with erased validity provenance",
+                        result_type,
+                        loc,
+                        "https://github.com/model-checking/kani/issues/920",
+                    )
+                } else if matches!(rv, Rvalue::Cast(CastKind::PtrToPtr, ..))
+                    && self
+                        .mutable_pointer_cast_requires_validity_check(self.operand_ty_stable(e), *t)
+                {
+                    let result_type = self.codegen_ty_stable(*t);
+                    self.codegen_unimplemented_expr(
+                        "mutable raw-pointer cast that erases a validity restriction",
+                        result_type,
+                        loc,
+                        "https://github.com/model-checking/kani/issues/920",
+                    )
+                } else {
+                    self.codegen_misc_cast(e, *t)
+                }
+            }
             Rvalue::Cast(CastKind::PointerCoercion(k), e, t) => {
                 self.codegen_pointer_cast(k, e, *t, loc)
             }
@@ -842,7 +1093,43 @@ impl GotocCtx<'_, '_> {
                 let src_sz = LayoutOf::new(src_ty).size_of().unwrap();
                 let dst_sz = LayoutOf::new(*ty).size_of().unwrap();
                 let dst_type = self.codegen_ty_stable(*ty);
-                if src_sz != dst_sz {
+                let is_transmute = matches!(
+                    rv,
+                    Rvalue::Cast(CastKind::Transmute | CastKind::BoxDerefTransmute, ..)
+                );
+                if matches!(ty.kind(), TyKind::RigidTy(RigidTy::Ref(..))) {
+                    self.codegen_unimplemented_expr(
+                        "transmute to a reference",
+                        dst_type,
+                        loc,
+                        "https://github.com/model-checking/kani/issues/920",
+                    )
+                } else if is_transmute
+                    && self.mutable_pointer_cast_requires_validity_check(src_ty, *ty)
+                {
+                    self.codegen_unimplemented_expr(
+                        "mutable raw-pointer transmute that erases a validity restriction",
+                        dst_type,
+                        loc,
+                        "https://github.com/model-checking/kani/issues/920",
+                    )
+                } else if is_transmute
+                    && self.transmute_contains_pointer_reinterpretation(src_ty, *ty)
+                {
+                    self.codegen_unimplemented_expr(
+                        "transmute containing pointer type reinterpretation",
+                        dst_type,
+                        loc,
+                        "https://github.com/model-checking/kani/issues/920",
+                    )
+                } else if is_transmute && self.transmute_destination_requires_validity_check(*ty) {
+                    self.codegen_unimplemented_expr(
+                        "transmute to a validity-restricted type",
+                        dst_type,
+                        loc,
+                        "https://github.com/model-checking/kani/issues/920",
+                    )
+                } else if src_sz != dst_sz {
                     Expr::statement_expression(
                         vec![
                             self.codegen_assert_assume_false(
@@ -931,6 +1218,15 @@ impl GotocCtx<'_, '_> {
                 }
             },
             Rvalue::Discriminant(p) => {
+                if self.raw_pointer_load_requires_validity_check(p, self.place_ty_stable(p)) {
+                    let result_type = self.codegen_ty_stable(res_ty);
+                    return self.codegen_unimplemented_expr(
+                        "raw pointer load of a validity-restricted type",
+                        result_type,
+                        loc,
+                        "https://github.com/model-checking/kani/issues/920",
+                    );
+                }
                 let place = unwrap_or_return_codegen_unimplemented!(
                     self,
                     self.codegen_place_stable(p, loc)
@@ -950,6 +1246,16 @@ impl GotocCtx<'_, '_> {
             // A CopyForDeref is equivalent to a read from a place at the codegen level.
             // https://github.com/rust-lang/rust/blob/1673f1450eeaf4a5452e086db0fe2ae274a0144f/compiler/rustc_middle/src/mir/syntax.rs#L1055
             Rvalue::CopyForDeref(place) => {
+                if self.raw_pointer_load_requires_validity_check(place, self.place_ty_stable(place))
+                {
+                    let typ = self.codegen_ty_stable(self.place_ty_stable(place));
+                    return self.codegen_unimplemented_expr(
+                        "raw pointer load of a validity-restricted type",
+                        typ,
+                        loc,
+                        "https://github.com/model-checking/kani/issues/920",
+                    );
+                }
                 if let Some(alignment_check) =
                     self.codegen_zst_raw_ptr_deref_alignment_check(place, loc)
                 {
@@ -994,10 +1300,24 @@ impl GotocCtx<'_, '_> {
         let layout = self.layout_of_stable(ty);
         match &layout.variants {
             // An uninhabited enum with no variants has no inhabitant, so reading its
-            // discriminant is unreachable at runtime. The rustc SSA backend returns a
-            // poison value for uninhabited layouts here; we mirror that with a nondet
-            // value of the target type (the surrounding code path is dead anyway).
-            Variants::Empty => Expr::nondet(self.codegen_ty_stable(res_ty)),
+            // discriminant is unreachable at runtime. Keep that impossibility visible
+            // to the verifier instead of returning an unconstrained value.
+            Variants::Empty => {
+                let result_type = self.codegen_ty_stable(res_ty);
+                let loc = *e.location();
+                Expr::statement_expression(
+                    vec![
+                        self.codegen_assert_assume_false(
+                            PropertyClass::Unreachable,
+                            "discriminant read from an uninhabited type",
+                            loc,
+                        ),
+                        Expr::nondet(result_type.clone()).as_stmt(loc),
+                    ],
+                    result_type,
+                    loc,
+                )
+            }
             Variants::Single { index } => {
                 let discr_val = layout
                     .ty

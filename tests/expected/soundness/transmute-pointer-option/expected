@@ -1,0 +1,1 @@
+transmute containing pointer type reinterpretation is not currently supported by Kani. Please post your example at https://github.com/model-checking/kani/issues/920

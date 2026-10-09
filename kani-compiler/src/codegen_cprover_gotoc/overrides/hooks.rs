@@ -9,6 +9,9 @@
 //! this module addresses this issue.
 
 use crate::codegen_cprover_gotoc::codegen::{PropertyClass, bb_label};
+use crate::codegen_cprover_gotoc::context::{
+    contains_quantifier_runtime_check_stmt, contains_quantifier_unmodeled_side_effect_stmt,
+};
 use crate::codegen_cprover_gotoc::{GotocCtx, utils};
 use crate::kani_middle::attributes;
 use crate::kani_middle::kani_functions::{
@@ -24,8 +27,8 @@ use rustc_middle::ty::TyCtxt;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{BasicBlockIdx, Place};
 use rustc_public::rustc_internal;
-use rustc_public::ty::{ClosureKind, FnDef};
 use rustc_public::ty::RigidTy;
+use rustc_public::ty::{ClosureKind, FnDef};
 use rustc_public::{CrateDef, ty::Span};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -1207,6 +1210,16 @@ fn build_quantifier_predicate(
             })
         })
         .unwrap_or_else(|| unreachable!("Failed to codegen closure for quantifier"));
+
+    // The direct substitution path below only retains the closure's return expression. If the
+    // closure body contains a runtime check, that check would otherwise disappear before the
+    // quantifier post-pass can reject it. Force the fallback path, which preserves the complete
+    // statement body for the post-pass check.
+    if contains_quantifier_runtime_check_stmt(&closure_body)
+        || contains_quantifier_unmodeled_side_effect_stmt(&closure_body)
+    {
+        return None;
+    }
 
     // Get the closure's parameter symbols.
     let parameters = gcx

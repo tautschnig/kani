@@ -3,6 +3,7 @@
 //! this module handles intrinsics
 use super::typ;
 use super::{PropertyClass, bb_label};
+use crate::args::ExtraChecks;
 use crate::codegen_cprover_gotoc::codegen::ty_stable::pointee_type_stable;
 use crate::codegen_cprover_gotoc::{GotocCtx, utils};
 use crate::intrinsics::Intrinsic;
@@ -625,7 +626,9 @@ impl GotocCtx<'_, '_> {
                 place,
                 loc,
             ),
-            Intrinsic::Transmute => self.codegen_intrinsic_transmute(fargs, ret_ty, place, loc),
+            Intrinsic::Transmute => {
+                self.codegen_intrinsic_transmute(fargs, farg_types[0], ret_ty, place, loc)
+            }
             Intrinsic::TruncF32 => codegen_simple_intrinsic!(Truncf),
             Intrinsic::TruncF64 => codegen_simple_intrinsic!(Trunc),
             Intrinsic::TypedSwap => self.codegen_swap(fargs, farg_types, loc),
@@ -639,6 +642,20 @@ impl GotocCtx<'_, '_> {
             // assuming an endianness. Dereferenceability itself is still checked
             // by `--pointer-check`, as for the aligned variants.
             Intrinsic::UnalignedVolatileLoad => {
+                let ret_requires_validity_check =
+                    self.transmute_destination_requires_validity_check(self.place_ty_stable(place));
+                if ret_requires_validity_check {
+                    let reason = if self.queries.args().ub_check.contains(&ExtraChecks::Validity) {
+                        "typed volatile load while validity checks are enabled"
+                    } else {
+                        "typed volatile load into a validity-restricted type"
+                    };
+                    return self.codegen_unimplemented_stmt(
+                        reason,
+                        loc,
+                        "https://github.com/model-checking/kani/issues/920",
+                    );
+                }
                 self.codegen_expr_to_place_stable(place, fargs.remove(0).dereference(), loc)
             }
             Intrinsic::UnalignedVolatileStore => {
@@ -1147,6 +1164,27 @@ impl GotocCtx<'_, '_> {
         // Compute the number of bytes to be copied
         let count = fargs.remove(0);
         let pointee_type = pointee_type_stable(farg_types[0]).unwrap();
+        // The return place of the compiler intrinsic is `()`, so it cannot
+        // describe the typed destination. For the two copy arguments, the
+        // destination is second after any volatile-copy argument swap above.
+        // Inspecting that pointee is essential: the byte-wise memmove/memcpy
+        // lowering must not make an invalid value of `bool`, a reference, an
+        // enum, or another validity-restricted type appear valid.
+        let destination_type = pointee_type_stable(farg_types[1]).unwrap();
+        if self.transmute_destination_requires_validity_check(destination_type) {
+            let reason = if self.queries.args().ub_check.contains(&ExtraChecks::Validity) {
+                format!(
+                    "typed byte copy into `{destination_type}` while validity checks are enabled"
+                )
+            } else {
+                format!("typed byte copy into validity-restricted type `{destination_type}`")
+            };
+            return self.codegen_unimplemented_stmt(
+                &reason,
+                loc,
+                "https://github.com/model-checking/kani/issues/920",
+            );
+        }
         let (count_bytes, overflow_check) =
             self.count_in_bytes(count, pointee_type, Type::size_t(), intrinsic, loc);
 
@@ -1303,11 +1341,33 @@ impl GotocCtx<'_, '_> {
     fn codegen_intrinsic_transmute(
         &mut self,
         mut fargs: Vec<Expr>,
+        src_ty: Ty,
         ret_ty: Ty,
         p: &Place,
         loc: Location,
     ) -> Stmt {
         assert!(fargs.len() == 1, "transmute had unexpected arguments {fargs:?}");
+        if matches!(ret_ty.kind(), TyKind::RigidTy(RigidTy::Ref(..))) {
+            return self.codegen_unimplemented_stmt(
+                "transmute to a reference",
+                loc,
+                "https://github.com/model-checking/kani/issues/920",
+            );
+        }
+        if self.transmute_contains_pointer_reinterpretation(src_ty, ret_ty) {
+            return self.codegen_unimplemented_stmt(
+                "transmute containing pointer type reinterpretation",
+                loc,
+                "https://github.com/model-checking/kani/issues/920",
+            );
+        }
+        if self.transmute_destination_requires_validity_check(ret_ty) {
+            return self.codegen_unimplemented_stmt(
+                "transmute to a validity-restricted type",
+                loc,
+                "https://github.com/model-checking/kani/issues/920",
+            );
+        }
         let arg = fargs.remove(0);
         let cbmc_ret_ty = self.codegen_ty_stable(ret_ty);
         let expr = arg.transmute_to(cbmc_ret_ty, &self.symbol_table);
@@ -1865,6 +1925,18 @@ impl GotocCtx<'_, '_> {
         p: &Place,
         loc: Location,
     ) -> Stmt {
+        if self.transmute_destination_requires_validity_check(self.place_ty_stable(p)) {
+            let reason = if self.queries.args().ub_check.contains(&ExtraChecks::Validity) {
+                "typed volatile load while validity checks are enabled"
+            } else {
+                "typed volatile load into a validity-restricted type"
+            };
+            return self.codegen_unimplemented_stmt(
+                reason,
+                loc,
+                "https://github.com/model-checking/kani/issues/920",
+            );
+        }
         let src = fargs.remove(0);
         let src_typ = farg_types[0];
         let align = self.is_ptr_aligned(src_typ, src.clone());
@@ -1938,6 +2010,21 @@ impl GotocCtx<'_, '_> {
 
         // Check that `dst` must be properly aligned
         let dst_typ = farg_types[0];
+        let destination_type = pointee_type_stable(dst_typ).unwrap();
+        if self.transmute_destination_requires_validity_check(destination_type) {
+            let reason = if self.queries.args().ub_check.contains(&ExtraChecks::Validity) {
+                format!(
+                    "typed byte write into `{destination_type}` while validity checks are enabled"
+                )
+            } else {
+                format!("typed byte write into validity-restricted type `{destination_type}`")
+            };
+            return self.codegen_unimplemented_stmt(
+                &reason,
+                loc,
+                "https://github.com/model-checking/kani/issues/920",
+            );
+        }
         let align = self.is_ptr_aligned(dst_typ, dst.clone());
         let align_check = self.codegen_assert_assume(
             align,
@@ -2031,8 +2118,16 @@ impl GotocCtx<'_, '_> {
 
         let x = fargs.remove(0);
         let y = fargs.remove(0);
+        let pointee_type = pointee_type_stable(farg_types[0]).unwrap();
+        if self.transmute_destination_requires_validity_check(pointee_type) {
+            return self.codegen_unimplemented_stmt(
+                "typed swap of a validity-restricted type",
+                loc,
+                "https://github.com/model-checking/kani/issues/920",
+            );
+        }
 
-        if self.is_zst_stable(pointee_type_stable(farg_types[0]).unwrap()) {
+        if self.is_zst_stable(pointee_type) {
             // Do not attempt to dereference (and assign) a ZST, but preserve
             // the alignment requirement of typed swap. There is no CBMC
             // storage access left to enforce it once the swap itself is
@@ -2066,18 +2161,16 @@ impl GotocCtx<'_, '_> {
             // below is byte-based even when T is wider than one byte. CBMC
             // does not support pointer arithmetic on void pointers, so use
             // `*u8` instead.
-            let pointee_type = pointee_type_stable(farg_types[0]).unwrap();
             let size = self.layout_of_stable(pointee_type).size.bytes();
             let size = Expr::int_constant(size, Type::size_t());
             let byte_ptr = Type::unsigned_int(8).to_pointer();
             let x_bytes = x.clone().cast_to(byte_ptr.clone());
             let y_bytes = y.clone().cast_to(byte_ptr);
-            let non_overlapping =
-                x_bytes
-                    .clone()
-                    .plus(size.clone())
-                    .le(y_bytes.clone())
-                    .or(y_bytes.plus(size).le(x_bytes));
+            let non_overlapping = x_bytes
+                .clone()
+                .plus(size.clone())
+                .le(y_bytes.clone())
+                .or(y_bytes.plus(size).le(x_bytes));
             let non_overlapping_check = self.codegen_assert_assume(
                 non_overlapping,
                 PropertyClass::SafetyCheck,

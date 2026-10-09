@@ -590,7 +590,14 @@ impl GotocCtx<'_, '_> {
                         let fn_ptr = vtable.member("drop", &self.symbol_table);
                         trace!(?fn_ptr, ?data_ref, "codegen_drop");
 
+                        // For soundness, do not let a null vtable entry turn the
+                        // indirect call into an assume(false) and make later
+                        // user assertions vacuously reachable.
+                        let drop_is_nonnull = fn_ptr.clone().is_nonnull();
+                        let assert_msg = "Non-null virtual drop function call";
+                        let assert_nonnull = self.codegen_sanity(drop_is_nonnull, assert_msg, loc);
                         let call = fn_ptr.dereference().call(vec![data_ref]).as_stmt(loc);
+                        let call = Stmt::block(vec![assert_nonnull, call], loc);
                         if self.vtable_ctx.emit_vtable_restrictions {
                             self.virtual_call_with_restricted_fn_ptr(
                                 place_ref.typ().clone(),
@@ -817,7 +824,20 @@ impl GotocCtx<'_, '_> {
             // dedicated model for it.
             let is_typed_swap =
                 instance.intrinsic_name().as_deref() == Some("typed_swap_nonoverlapping");
+            // `copy` likewise has a compiler-provided fallback body. Its byte-wise lowering
+            // loses the validity requirement of the typed destination: copying arbitrary bytes
+            // into `bool`, references, enums, and other validity-restricted types must not make
+            // an invalid typed value appear valid to later MIR operations.
+            let is_copy = instance.intrinsic_name().as_deref() == Some("copy");
+            // Byte-write intrinsics likewise have compiler-provided fallback bodies that lower
+            // to raw byte writes. That loses the validity restriction of the typed destination.
+            let is_byte_write = matches!(
+                instance.intrinsic_name().as_deref(),
+                Some("write_bytes" | "volatile_set_memory")
+            );
             if is_typed_swap
+                || is_copy
+                || is_byte_write
                 || def.as_intrinsic().unwrap().must_be_overridden()
                 || !instance.has_body()
             {

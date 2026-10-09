@@ -16,8 +16,8 @@
 //! this structure as input.
 use super::current_fn::CurrentFnCtx;
 use super::vtable_ctx::VtableCtx;
-use crate::codegen_cprover_gotoc::codegen::PropertyClass;
 use crate::codegen_cprover_gotoc::UnsupportedConstructs;
+use crate::codegen_cprover_gotoc::codegen::PropertyClass;
 use crate::codegen_cprover_gotoc::overrides::{GotocHooks, fn_hooks};
 use crate::codegen_cprover_gotoc::utils::full_crate_name;
 use crate::kani_middle::transform::BodyTransformation;
@@ -350,8 +350,8 @@ impl<'tcx, 'r> GotocCtx<'tcx, 'r> {
 /// `BinOp`, `UnOp`, etc. — no statements, no gotos, no labels.
 ///
 /// **Soundness note**: When flattening `StatementExpression` nodes (e.g., from checked
-/// arithmetic), runtime checks (Assert/Assume for overflow, division by zero) are dropped.
-/// Users must ensure arithmetic in quantifier predicates cannot overflow or divide by zero.
+/// arithmetic), runtime checks (Assert/Assume) are dropped. Quantifier lowering rejects
+/// predicates containing such statements before this simplification is used.
 ///
 /// TODO(#4567): Remove `#[allow(dead_code)]` when used by quantifier-pure-expressions branch.
 #[allow(dead_code)]
@@ -574,6 +574,15 @@ impl GotocCtx<'_, '_> {
             return original_expr.clone();
         };
 
+        // Inlining keeps only the returned expression. If the function body has
+        // statements or expression-level effects that are not representable in
+        // a pure quantified predicate, retaining just the return value would
+        // silently erase them. Leave the call in place so the post-pass can
+        // reject the quantifier instead.
+        if contains_quantifier_unmodeled_side_effect_stmt(&body) {
+            return original_expr.clone();
+        }
+
         visited.insert(*fn_id);
 
         let mut assignments: HashMap<InternedString, Expr> = HashMap::new();
@@ -735,12 +744,20 @@ impl GotocCtx<'_, '_> {
                                     suffix_count,
                                 )
                                 .unwrap();
-                            let unsupported_check =
-                                if contains_quantifier_arithmetic_check(&inlined_domain)
-                            {
+                            let unsupported_check = if contains_quantifier_runtime_check(
+                                &inlined_domain,
+                            ) {
                                 self.codegen_assert_assume_false(
                                     PropertyClass::UnsupportedConstruct,
                                     "quantifier predicate contains runtime checks that Kani cannot soundly encode",
+                                    *domain.location(),
+                                )
+                            } else if contains_quantifier_unmodeled_side_effect_stmt(
+                                &Stmt::code_expression(inlined_domain.clone(), *domain.location()),
+                            ) {
+                                self.codegen_assert_assume_false(
+                                    PropertyClass::UnsupportedConstruct,
+                                    "quantifier predicate contains side effects that Kani cannot soundly encode",
                                     *domain.location(),
                                 )
                             } else {
@@ -785,12 +802,20 @@ impl GotocCtx<'_, '_> {
                                     &mut suffix_count,
                                 )
                                 .unwrap();
-                            let unsupported_check =
-                                if contains_quantifier_arithmetic_check(&inlined_domain)
-                            {
+                            let unsupported_check = if contains_quantifier_runtime_check(
+                                &inlined_domain,
+                            ) {
                                 self.codegen_assert_assume_false(
                                     PropertyClass::UnsupportedConstruct,
                                     "quantifier predicate contains runtime checks that Kani cannot soundly encode",
+                                    *domain.location(),
+                                )
+                            } else if contains_quantifier_unmodeled_side_effect_stmt(
+                                &Stmt::code_expression(inlined_domain.clone(), *domain.location()),
+                            ) {
+                                self.codegen_assert_assume_false(
+                                    PropertyClass::UnsupportedConstruct,
+                                    "quantifier predicate contains side effects that Kani cannot soundly encode",
                                     *domain.location(),
                                 )
                             } else {
@@ -859,11 +884,11 @@ impl GotocCtx<'_, '_> {
                 Some(self.handle_quantifiers_in_stmt(body, suffix_count)?.with_label(*label))
             }
             _ => None,
+        }
     }
-}
 
-/// Count and return the number of return statements in `stmt`.
-fn count_return_stmts(stmt: &Stmt) -> usize {
+    /// Count and return the number of return statements in `stmt`.
+    fn count_return_stmts(stmt: &Stmt) -> usize {
         match stmt.body() {
             StmtBody::Return(_) => 1,
             StmtBody::Block(stmts) => stmts.iter().map(Self::count_return_stmts).sum(),
@@ -1210,59 +1235,58 @@ fn count_return_stmts(stmt: &Stmt) -> usize {
     }
 }
 
-/// Return whether an expression contains an arithmetic runtime check.
+/// Return whether an expression contains a runtime check that cannot be preserved
+/// inside a pure quantified predicate.
 ///
 /// CBMC cannot soundly preserve such statements inside a quantified predicate. In particular,
 /// Rust's checked arithmetic emits an assertion for overflow, and silently dropping it can turn a
-/// panic into a successful proof.
-fn contains_quantifier_arithmetic_check(expr: &Expr) -> bool {
+/// panic into a successful proof. The same applies to user assertions in the predicate.
+fn contains_quantifier_runtime_check(expr: &Expr) -> bool {
     match expr.value() {
         ExprValue::AddressOf(e)
         | ExprValue::ArrayOf { elem: e }
         | ExprValue::ByteExtract { e, .. }
         | ExprValue::Dereference(e)
         | ExprValue::Typecast(e)
-        | ExprValue::UnOp { e, .. } => contains_quantifier_arithmetic_check(e),
+        | ExprValue::UnOp { e, .. } => contains_quantifier_runtime_check(e),
         ExprValue::Array { elems } | ExprValue::Vector { elems } => {
-            elems.iter().any(contains_quantifier_arithmetic_check)
+            elems.iter().any(contains_quantifier_runtime_check)
         }
         ExprValue::Assign { left, right } => {
-            contains_quantifier_arithmetic_check(left) || contains_quantifier_arithmetic_check(right)
+            contains_quantifier_runtime_check(left) || contains_quantifier_runtime_check(right)
         }
         ExprValue::BinOp { lhs, rhs, .. } => {
-            contains_quantifier_arithmetic_check(lhs) || contains_quantifier_arithmetic_check(rhs)
+            contains_quantifier_runtime_check(lhs) || contains_quantifier_runtime_check(rhs)
         }
         ExprValue::FunctionCall { function, arguments } => {
-            contains_quantifier_arithmetic_check(function)
-                || arguments.iter().any(contains_quantifier_arithmetic_check)
+            contains_quantifier_runtime_check(function)
+                || arguments.iter().any(contains_quantifier_runtime_check)
         }
         ExprValue::If { c, t, e } => {
-            contains_quantifier_arithmetic_check(c)
-                || contains_quantifier_arithmetic_check(t)
-                || contains_quantifier_arithmetic_check(e)
+            contains_quantifier_runtime_check(c)
+                || contains_quantifier_runtime_check(t)
+                || contains_quantifier_runtime_check(e)
         }
         ExprValue::Index { array, index } => {
-            contains_quantifier_arithmetic_check(array)
-                || contains_quantifier_arithmetic_check(index)
+            contains_quantifier_runtime_check(array) || contains_quantifier_runtime_check(index)
         }
-        ExprValue::Member { lhs, .. } => contains_quantifier_arithmetic_check(lhs),
+        ExprValue::Member { lhs, .. } => contains_quantifier_runtime_check(lhs),
         ExprValue::ReadOk { ptr, size } => {
-            contains_quantifier_arithmetic_check(ptr)
-                || contains_quantifier_arithmetic_check(size)
+            contains_quantifier_runtime_check(ptr) || contains_quantifier_runtime_check(size)
         }
-        ExprValue::SelfOp { e, .. } => contains_quantifier_arithmetic_check(e),
+        ExprValue::SelfOp { e, .. } => contains_quantifier_runtime_check(e),
         ExprValue::ShuffleVector { vector1, vector2, indexes } => {
-            contains_quantifier_arithmetic_check(vector1)
-                || contains_quantifier_arithmetic_check(vector2)
-                || indexes.iter().any(contains_quantifier_arithmetic_check)
+            contains_quantifier_runtime_check(vector1)
+                || contains_quantifier_runtime_check(vector2)
+                || indexes.iter().any(contains_quantifier_runtime_check)
         }
         ExprValue::StatementExpression { statements, .. } => {
-            statements.iter().any(contains_quantifier_arithmetic_check_stmt)
+            statements.iter().any(contains_quantifier_runtime_check_stmt)
         }
-        ExprValue::Struct { values } => values.iter().any(contains_quantifier_arithmetic_check),
-        ExprValue::Union { value, .. } => contains_quantifier_arithmetic_check(value),
+        ExprValue::Struct { values } => values.iter().any(contains_quantifier_runtime_check),
+        ExprValue::Union { value, .. } => contains_quantifier_runtime_check(value),
         ExprValue::Forall { domain, .. } | ExprValue::Exists { domain, .. } => {
-            contains_quantifier_arithmetic_check(domain)
+            contains_quantifier_runtime_check(domain)
         }
         ExprValue::BoolConstant(_)
         | ExprValue::CBoolConstant(_)
@@ -1279,63 +1303,152 @@ fn contains_quantifier_arithmetic_check(expr: &Expr) -> bool {
     }
 }
 
-fn contains_quantifier_arithmetic_check_stmt(stmt: &Stmt) -> bool {
+pub(crate) fn contains_quantifier_runtime_check_stmt(stmt: &Stmt) -> bool {
     match stmt.body() {
-        StmtBody::Assert { property_class, msg, .. } => {
-            let property_class = property_class.to_string();
-            let message = msg.to_string();
-            matches!(property_class.as_str(), "arithmetic_overflow" | "exact_div" | "finite_check")
-                || message.contains("overflow")
-                || message.contains("division")
-                || message.contains("remainder")
-                || message.contains("finite")
-        }
+        // The pure-expression lowering drops all assertion and assumption statements. Any such
+        // statement in a quantifier predicate must therefore be rejected, even when it is not
+        // one of Rust's arithmetic checks.
+        StmtBody::Assert { .. } | StmtBody::Assume { .. } => true,
         StmtBody::Assign { lhs, rhs } => {
-            contains_quantifier_arithmetic_check(lhs)
-                || contains_quantifier_arithmetic_check(rhs)
+            contains_quantifier_runtime_check(lhs) || contains_quantifier_runtime_check(rhs)
         }
         StmtBody::AtomicBlock(stmts) | StmtBody::Block(stmts) => {
-            stmts.iter().any(contains_quantifier_arithmetic_check_stmt)
+            stmts.iter().any(contains_quantifier_runtime_check_stmt)
         }
-        StmtBody::Dead(e) | StmtBody::Expression(e) => contains_quantifier_arithmetic_check(e),
+        StmtBody::Dead(e) | StmtBody::Expression(e) => contains_quantifier_runtime_check(e),
         StmtBody::Decl { lhs, value } => {
-            contains_quantifier_arithmetic_check(lhs)
-                || value.as_ref().is_some_and(contains_quantifier_arithmetic_check)
+            contains_quantifier_runtime_check(lhs)
+                || value.as_ref().is_some_and(contains_quantifier_runtime_check)
         }
         StmtBody::For { init, cond, update, body } => {
-            contains_quantifier_arithmetic_check_stmt(init)
-                || contains_quantifier_arithmetic_check(cond)
-                || contains_quantifier_arithmetic_check_stmt(update)
-                || contains_quantifier_arithmetic_check_stmt(body)
+            contains_quantifier_runtime_check_stmt(init)
+                || contains_quantifier_runtime_check(cond)
+                || contains_quantifier_runtime_check_stmt(update)
+                || contains_quantifier_runtime_check_stmt(body)
         }
         StmtBody::FunctionCall { lhs, function, arguments } => {
-            lhs.as_ref().is_some_and(contains_quantifier_arithmetic_check)
-                || contains_quantifier_arithmetic_check(function)
-                || arguments.iter().any(contains_quantifier_arithmetic_check)
+            lhs.as_ref().is_some_and(contains_quantifier_runtime_check)
+                || contains_quantifier_runtime_check(function)
+                || arguments.iter().any(contains_quantifier_runtime_check)
         }
         StmtBody::Ifthenelse { i, t, e } => {
-            contains_quantifier_arithmetic_check(i)
-                || contains_quantifier_arithmetic_check_stmt(t)
-                || e.as_ref().is_some_and(contains_quantifier_arithmetic_check_stmt)
+            contains_quantifier_runtime_check(i)
+                || contains_quantifier_runtime_check_stmt(t)
+                || e.as_ref().is_some_and(contains_quantifier_runtime_check_stmt)
         }
-        StmtBody::Label { body, .. } => contains_quantifier_arithmetic_check_stmt(body),
-        StmtBody::Return(value) => {
-            value.as_ref().is_some_and(contains_quantifier_arithmetic_check)
-        }
+        StmtBody::Label { body, .. } => contains_quantifier_runtime_check_stmt(body),
+        StmtBody::Return(value) => value.as_ref().is_some_and(contains_quantifier_runtime_check),
         StmtBody::Switch { control, cases, default } => {
-            contains_quantifier_arithmetic_check(control)
-                || cases.iter().any(|case| contains_quantifier_arithmetic_check_stmt(case.body()))
-                || default.as_ref().is_some_and(contains_quantifier_arithmetic_check_stmt)
+            contains_quantifier_runtime_check(control)
+                || cases.iter().any(|case| contains_quantifier_runtime_check_stmt(case.body()))
+                || default.as_ref().is_some_and(contains_quantifier_runtime_check_stmt)
         }
         StmtBody::While { cond, body } => {
-            contains_quantifier_arithmetic_check(cond)
-                || contains_quantifier_arithmetic_check_stmt(body)
+            contains_quantifier_runtime_check(cond) || contains_quantifier_runtime_check_stmt(body)
         }
-        StmtBody::Assume { .. }
-        | StmtBody::Break
-        | StmtBody::Continue
-        | StmtBody::Goto { .. }
-        | StmtBody::Skip => false,
+        StmtBody::Break | StmtBody::Continue | StmtBody::Goto { .. } | StmtBody::Skip => false,
+    }
+}
+
+/// Return whether a statement contains effects that pure quantifier lowering
+/// cannot preserve.
+///
+/// Quantifier predicates are represented as pure CBMC expressions. The
+/// extraction and inlining paths intentionally retain only returned values and
+/// local dataflow. Any call, memory write, nondeterministic value, or control
+/// statement with observable execution must therefore cause the quantifier to
+/// be rejected rather than silently dropped.
+pub(crate) fn contains_quantifier_unmodeled_side_effect_stmt(stmt: &Stmt) -> bool {
+    match stmt.body() {
+        StmtBody::Assign { lhs, rhs } => {
+            !matches!(lhs.value(), ExprValue::Symbol { .. })
+                || contains_quantifier_unmodeled_side_effect(rhs)
+        }
+        StmtBody::Assert { .. } | StmtBody::Assume { .. } => true,
+        StmtBody::AtomicBlock(stmts) | StmtBody::Block(stmts) => {
+            stmts.iter().any(contains_quantifier_unmodeled_side_effect_stmt)
+        }
+        StmtBody::Dead(expr) | StmtBody::Expression(expr) => {
+            contains_quantifier_unmodeled_side_effect(expr)
+        }
+        StmtBody::Decl { lhs, value } => {
+            !matches!(lhs.value(), ExprValue::Symbol { .. })
+                || value.as_ref().is_some_and(contains_quantifier_unmodeled_side_effect)
+        }
+        // Function calls are not safe to inline unless their complete bodies
+        // have already been proven to be in the pure fragment.
+        StmtBody::FunctionCall { .. } => true,
+        // The quantifier extractor does not preserve statement-level control
+        // flow. Reject it here instead of applying last-write-wins dataflow.
+        StmtBody::For { .. }
+        | StmtBody::Ifthenelse { .. }
+        | StmtBody::Switch { .. }
+        | StmtBody::While { .. } => true,
+        StmtBody::Label { body, .. } => contains_quantifier_unmodeled_side_effect_stmt(body),
+        StmtBody::Return(value) => {
+            value.as_ref().is_some_and(contains_quantifier_unmodeled_side_effect)
+        }
+        StmtBody::Break | StmtBody::Continue | StmtBody::Goto { .. } | StmtBody::Skip => false,
+    }
+}
+
+fn contains_quantifier_unmodeled_side_effect(expr: &Expr) -> bool {
+    match expr.value() {
+        ExprValue::AddressOf(expr)
+        | ExprValue::ArrayOf { elem: expr }
+        | ExprValue::ByteExtract { e: expr, .. }
+        | ExprValue::Dereference(expr)
+        | ExprValue::Typecast(expr)
+        | ExprValue::UnOp { e: expr, .. } => contains_quantifier_unmodeled_side_effect(expr),
+        ExprValue::Array { elems } | ExprValue::Vector { elems } => {
+            elems.iter().any(contains_quantifier_unmodeled_side_effect)
+        }
+        ExprValue::Assign { .. } => true,
+        ExprValue::BinOp { lhs, rhs, .. } => {
+            contains_quantifier_unmodeled_side_effect(lhs)
+                || contains_quantifier_unmodeled_side_effect(rhs)
+        }
+        ExprValue::FunctionCall { .. } | ExprValue::Nondet | ExprValue::SelfOp { .. } => true,
+        ExprValue::If { c, t, e } => {
+            contains_quantifier_unmodeled_side_effect(c)
+                || contains_quantifier_unmodeled_side_effect(t)
+                || contains_quantifier_unmodeled_side_effect(e)
+        }
+        ExprValue::Index { array, index } => {
+            contains_quantifier_unmodeled_side_effect(array)
+                || contains_quantifier_unmodeled_side_effect(index)
+        }
+        ExprValue::Member { lhs, .. } => contains_quantifier_unmodeled_side_effect(lhs),
+        ExprValue::ReadOk { ptr, size } => {
+            contains_quantifier_unmodeled_side_effect(ptr)
+                || contains_quantifier_unmodeled_side_effect(size)
+        }
+        ExprValue::ShuffleVector { vector1, vector2, indexes } => {
+            contains_quantifier_unmodeled_side_effect(vector1)
+                || contains_quantifier_unmodeled_side_effect(vector2)
+                || indexes.iter().any(contains_quantifier_unmodeled_side_effect)
+        }
+        ExprValue::StatementExpression { statements, .. } => {
+            statements.iter().any(contains_quantifier_unmodeled_side_effect_stmt)
+        }
+        ExprValue::Struct { values } => {
+            values.iter().any(contains_quantifier_unmodeled_side_effect)
+        }
+        ExprValue::Union { value, .. } => contains_quantifier_unmodeled_side_effect(value),
+        ExprValue::Forall { domain, .. } | ExprValue::Exists { domain, .. } => {
+            contains_quantifier_unmodeled_side_effect(domain)
+        }
+        ExprValue::BoolConstant(_)
+        | ExprValue::CBoolConstant(_)
+        | ExprValue::DoubleConstant(_)
+        | ExprValue::EmptyUnion
+        | ExprValue::Float16Constant(_)
+        | ExprValue::Float128Constant(_)
+        | ExprValue::FloatConstant(_)
+        | ExprValue::IntConstant(_)
+        | ExprValue::PointerConstant(_)
+        | ExprValue::StringConstant { .. }
+        | ExprValue::Symbol { .. } => false,
     }
 }
 

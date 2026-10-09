@@ -63,7 +63,7 @@ macro_rules! kani_mem_init {
                 let offset = super::mem::pointer_offset(ptr);
                 if self.tracked_object_id == obj
                     && self.tracked_offset >= offset
-                    && self.tracked_offset < offset + LAYOUT_SIZE
+                    && self.tracked_offset < offset.saturating_add(LAYOUT_SIZE)
                 {
                     !layout[self.tracked_offset - offset] || self.value
                 } else {
@@ -88,7 +88,7 @@ macro_rules! kani_mem_init {
                 let offset = super::mem::pointer_offset(ptr);
                 if self.tracked_object_id == obj
                     && self.tracked_offset >= offset
-                    && self.tracked_offset < offset + LAYOUT_SIZE
+                    && self.tracked_offset < offset.saturating_add(LAYOUT_SIZE)
                 {
                     self.value = layout[self.tracked_offset - offset] && value;
                 }
@@ -103,20 +103,30 @@ macro_rules! kani_mem_init {
                 to_ptr: *const u8,
                 num_elts: usize,
             ) {
+                if num_elts == 0 {
+                    return;
+                }
+
                 let from_obj = super::mem::pointer_object(from_ptr);
                 let from_offset = super::mem::pointer_offset(from_ptr);
 
                 let to_obj = super::mem::pointer_object(to_ptr);
                 let to_offset = super::mem::pointer_offset(to_ptr);
+                let copy_size = num_elts.saturating_mul(LAYOUT_SIZE);
 
                 if self.tracked_object_id == from_obj
                     && self.tracked_offset >= from_offset
-                    && self.tracked_offset < from_offset + num_elts * LAYOUT_SIZE
+                    && self.tracked_offset < from_offset.saturating_add(copy_size)
                 {
                     let should_reset: bool = super::any();
                     if should_reset {
                         self.tracked_object_id = to_obj;
-                        self.tracked_offset += to_offset - from_offset;
+                        // `to_offset` may be smaller than `from_offset` for a valid
+                        // overlapping copy. Move the tracked byte by preserving its
+                        // source-relative offset. The range check above guarantees
+                        // that the subtraction is in bounds, without requiring a
+                        // potentially wrapping `to_offset - from_offset`.
+                        self.tracked_offset = to_offset + (self.tracked_offset - from_offset);
                         // Note that this preserves the value.
                     }
                 } else {
@@ -131,10 +141,11 @@ macro_rules! kani_mem_init {
             pub fn bless<const LAYOUT_SIZE: usize>(&mut self, ptr: *const u8, num_elts: usize) {
                 let obj = super::mem::pointer_object(ptr);
                 let offset = super::mem::pointer_offset(ptr);
+                let size = num_elts.saturating_mul(LAYOUT_SIZE);
 
                 if self.tracked_object_id == obj
                     && self.tracked_offset >= offset
-                    && self.tracked_offset < offset + num_elts * LAYOUT_SIZE
+                    && self.tracked_offset < offset.saturating_add(size)
                 {
                     self.value = true;
                 }
@@ -155,9 +166,10 @@ macro_rules! kani_mem_init {
             ) -> bool {
                 let obj = super::mem::pointer_object(ptr);
                 let offset = super::mem::pointer_offset(ptr);
+                let size = num_elts.saturating_mul(LAYOUT_SIZE);
                 if self.tracked_object_id == obj
                     && self.tracked_offset >= offset
-                    && self.tracked_offset < offset + num_elts * LAYOUT_SIZE
+                    && self.tracked_offset < offset.saturating_add(size)
                 {
                     !layout[(self.tracked_offset - offset) % LAYOUT_SIZE] || self.value
                 } else {
@@ -181,9 +193,10 @@ macro_rules! kani_mem_init {
             ) {
                 let obj = super::mem::pointer_object(ptr);
                 let offset = super::mem::pointer_offset(ptr);
+                let size = num_elts.saturating_mul(LAYOUT_SIZE);
                 if self.tracked_object_id == obj
                     && self.tracked_offset >= offset
-                    && self.tracked_offset < offset + num_elts * LAYOUT_SIZE
+                    && self.tracked_offset < offset.saturating_add(size)
                 {
                     self.value = layout[(self.tracked_offset - offset) % LAYOUT_SIZE] && value;
                 }

@@ -211,8 +211,8 @@ impl GotocCodegenBackend {
         // Post-pass: inline remaining function calls in quantifier bodies.
         // User-defined function calls (e.g., comp(x, y)) require this post-pass
         // because the called functions may not be in the symbol table when the
-        // quantifier hook runs. It also rejects arithmetic runtime checks that
-        // cannot be represented soundly inside a pure quantified expression.
+        // quantifier hook runs. It also rejects runtime checks that cannot be
+        // represented soundly inside a pure quantified expression.
         gcx.handle_quantifiers();
 
         // Split ownership of the context so that the majority of fields can be saved to our results,

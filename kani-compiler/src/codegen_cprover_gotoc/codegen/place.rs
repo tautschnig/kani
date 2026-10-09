@@ -14,8 +14,8 @@ use cbmc::goto_program::{Expr, ExprValue, Location, Stmt, Type};
 use rustc_abi::{TagEncoding, Variants};
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_public::mir::{FieldIdx, Local, Mutability, Place, ProjectionElem};
-use rustc_public::rustc_internal;
-use rustc_public::ty::{RigidTy, Ty, TyKind, VariantDef, VariantIdx};
+use rustc_public::ty::{AdtKind, RigidTy, Ty, TyKind, VariantDef, VariantIdx};
+use rustc_public::{CrateDefType, rustc_internal};
 use tracing::{debug, trace, warn};
 
 /// A projection in Kani can either be to a type (the normal case),
@@ -262,6 +262,30 @@ impl GotocCtx<'_, '_> {
                     }
                     // if we fall here, then we are handling either a struct or a union
                     TyKind::RigidTy(RigidTy::Adt(def, _)) => {
+                        if def.kind() == AdtKind::Union {
+                            let field_ty = field_ty_or_var.expect_type();
+                            let operation = if self
+                                .transmute_destination_requires_validity_check(field_ty)
+                            {
+                                Some("union field access of a validity-restricted type")
+                            } else if self.union_pointer_field_erases_validity(
+                                parent_ty,
+                                field_idx,
+                                field_ty_or_var,
+                            ) {
+                                Some("union pointer field access that erases a validity restriction")
+                            } else {
+                                None
+                            };
+                            if let Some(operation) = operation {
+                                return Err(Box::new(UnimplementedData::new(
+                                    operation,
+                                    "https://github.com/model-checking/kani/issues/920",
+                                    self.codegen_ty_stable(field_ty),
+                                    *parent_expr.location(),
+                                )));
+                            }
+                        }
                         let fields = def.variants_iter().next().unwrap().fields();
                         let field = &fields[field_idx];
                         Ok(parent_expr.member(field.name.to_string(), &self.symbol_table))
@@ -320,6 +344,39 @@ impl GotocCtx<'_, '_> {
                 Ok(parent_expr.member(field_name, &self.symbol_table))
             }
         }
+    }
+
+    fn union_pointer_field_erases_validity(
+        &self,
+        parent_ty: Ty,
+        field_idx: FieldIdx,
+        field_ty_or_var: TypeOrVariant,
+    ) -> bool {
+        let TypeOrVariant::Type(field_ty) = field_ty_or_var else {
+            return false;
+        };
+        let TyKind::RigidTy(RigidTy::RawPtr(field_pointee, Mutability::Mut)) = field_ty.kind()
+        else {
+            return false;
+        };
+        let TyKind::RigidTy(RigidTy::Adt(def, args)) = parent_ty.kind() else {
+            return false;
+        };
+        if def.kind() != AdtKind::Union {
+            return false;
+        }
+        let fields = def.variants_iter().next().unwrap().fields();
+        let field_restriction = self.transmute_destination_requires_validity_check(field_pointee);
+        fields.iter().enumerate().any(|(other_idx, other)| {
+            if other_idx == field_idx {
+                return false;
+            }
+            let other_ty = other.ty_with_args(&args);
+            let TyKind::RigidTy(RigidTy::RawPtr(other_pointee, _)) = other_ty.kind() else {
+                return false;
+            };
+            self.transmute_destination_requires_validity_check(other_pointee) != field_restriction
+        })
     }
 
     /// This is a SIMD vector, which has 2 possible internal representations:

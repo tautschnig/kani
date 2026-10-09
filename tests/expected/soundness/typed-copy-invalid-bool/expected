@@ -1,0 +1,3 @@
+std::ptr::copy::<bool>.unsupported_construct.\
+	 - Status: FAILURE\
+	 - Description: "Kani currently doesn't support checking validity of `typed copy` for `bool`"

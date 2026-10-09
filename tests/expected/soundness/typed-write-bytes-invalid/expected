@@ -1,0 +1,2 @@
+typed byte write into validity-restricted type `bool` is not currently supported by Kani. Please post your example at https://github.com/model-checking/kani/issues/920
+typed byte write into validity-restricted type `bool` is not currently supported by Kani. Please post your example at https://github.com/model-checking/kani/issues/920

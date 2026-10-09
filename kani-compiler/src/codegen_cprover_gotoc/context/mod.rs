@@ -11,4 +11,7 @@ mod goto_ctx;
 mod vtable_ctx;
 
 pub use goto_ctx::{GotocCtx, MinimalGotocCtx};
+pub(crate) use goto_ctx::{
+    contains_quantifier_runtime_check_stmt, contains_quantifier_unmodeled_side_effect_stmt,
+};
 pub use vtable_ctx::VtableCtx;
