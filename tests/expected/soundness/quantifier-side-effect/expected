@@ -1,0 +1,1 @@
+quantifier predicate contains runtime checks that Kani cannot soundly encode

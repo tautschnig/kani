@@ -1,0 +1,1 @@
+loop-contract expression has side effects that Kani cannot soundly model

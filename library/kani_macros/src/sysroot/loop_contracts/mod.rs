@@ -11,8 +11,8 @@ use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::token::AndAnd;
 use syn::{
-    BinOp, Block, Expr, ExprBinary, ExprForLoop, ExprWhile, Ident, Stmt, Token, parse_macro_input,
-    parse_quote, visit_mut::VisitMut,
+    BinOp, Block, Expr, ExprAssign, ExprBinary, ExprForLoop, ExprWhile, Ident, Stmt, Token,
+    parse_macro_input, parse_quote, visit_mut::VisitMut,
 };
 
 /*
@@ -97,6 +97,43 @@ struct TransformationResult {
     transformed_expr: Expr,
     declarations_block: Block,
     assignments_block: Block,
+}
+
+/// Track direct assignments in a loop-contract clause.
+///
+/// The clause is evaluated as part of the generated loop-head model. A write from the clause can
+/// therefore change the loop guard or body and make a false property appear true. Calls whose
+/// bodies may write memory remain a known limitation; direct assignments are rejected here because
+/// they are unambiguously observable and otherwise create a straightforward false-proof pattern.
+#[derive(Default)]
+struct AssignmentChecker {
+    found: bool,
+}
+
+impl VisitMut for AssignmentChecker {
+    fn visit_expr_assign_mut(&mut self, expr: &mut ExprAssign) {
+        self.found = true;
+        syn::visit_mut::visit_expr_assign_mut(self, expr);
+    }
+
+    fn visit_expr_binary_mut(&mut self, expr: &mut ExprBinary) {
+        if matches!(
+            expr.op,
+            BinOp::AddAssign(_)
+                | BinOp::SubAssign(_)
+                | BinOp::MulAssign(_)
+                | BinOp::DivAssign(_)
+                | BinOp::RemAssign(_)
+                | BinOp::BitXorAssign(_)
+                | BinOp::BitAndAssign(_)
+                | BinOp::BitOrAssign(_)
+                | BinOp::ShlAssign(_)
+                | BinOp::ShrAssign(_)
+        ) {
+            self.found = true;
+        }
+        syn::visit_mut::visit_expr_binary_mut(self, expr);
+    }
 }
 
 struct CallReplacer {
@@ -595,6 +632,18 @@ pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
     // expr of the loop invariant
     let mut inv_expr: Expr = syn::parse(attr).unwrap();
     let original_span = inv_expr.span();
+    let mut assignment_checker = AssignmentChecker::default();
+    assignment_checker.visit_expr_mut(&mut inv_expr);
+    if assignment_checker.found {
+        return Diagnostic::spanned(
+            original_span,
+            Level::Error,
+            "`#[kani::loop_invariant]` expressions must not assign to memory; \
+             side-effecting calls remain unsupported",
+        )
+        .emit_as_item_tokens()
+        .into();
+    }
     if let Some(ForLoopExtraStmts { ref kani_index, ref kani_iter_len, .. }) = for_loop_extras {
         let mut index_replacer = KaniIndexReplacer { kani_index: kani_index.clone() };
         index_replacer.visit_expr_mut(&mut inv_expr);
@@ -859,9 +908,22 @@ fn generate_unique_id_from_span(stmt: &Stmt) -> String {
 }
 
 pub fn loop_modifies(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let assigns = parse_macro_input!(attr with Punctuated::<Expr, Token![,]>::parse_terminated)
+    let mut assigns = parse_macro_input!(attr with Punctuated::<Expr, Token![,]>::parse_terminated)
         .into_iter()
         .collect::<Vec<Expr>>();
+    let mut assignment_checker = AssignmentChecker::default();
+    for expr in &mut assigns {
+        assignment_checker.visit_expr_mut(expr);
+    }
+    if assignment_checker.found {
+        return Diagnostic::spanned(
+            assigns.first().map_or_else(proc_macro2::Span::call_site, |expr| expr.span()),
+            Level::Error,
+            "loop-contract expressions must not assign to memory; side-effecting calls remain unsupported",
+        )
+        .emit_as_item_tokens()
+        .into();
+    }
     let loop_assign_name: String = "kani_loop_modifies".to_owned();
     let loop_assign_ident = format_ident!("{}", loop_assign_name);
     let loop_assign_stmt: Stmt = parse_quote! {
@@ -888,9 +950,23 @@ pub fn loop_modifies(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// For multi-dimensional decreases, CBMC uses lexicographic ordering.
 pub fn loop_decreases(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let decreases = parse_macro_input!(attr with Punctuated::<Expr, Token![,]>::parse_terminated)
-        .into_iter()
-        .collect::<Vec<Expr>>();
+    let mut decreases =
+        parse_macro_input!(attr with Punctuated::<Expr, Token![,]>::parse_terminated)
+            .into_iter()
+            .collect::<Vec<Expr>>();
+    let mut assignment_checker = AssignmentChecker::default();
+    for expr in &mut decreases {
+        assignment_checker.visit_expr_mut(expr);
+    }
+    if assignment_checker.found {
+        return Diagnostic::spanned(
+            decreases.first().map_or_else(proc_macro2::Span::call_site, |expr| expr.span()),
+            Level::Error,
+            "loop-contract expressions must not assign to memory; side-effecting calls remain unsupported",
+        )
+        .emit_as_item_tokens()
+        .into();
+    }
     if decreases.len() > 1 {
         return syn::Error::new(
             proc_macro2::Span::call_site(),

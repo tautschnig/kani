@@ -1,0 +1,1 @@
+`#[kani::loop_invariant]` expressions must not assign to memory; side-effecting calls remain unsupported

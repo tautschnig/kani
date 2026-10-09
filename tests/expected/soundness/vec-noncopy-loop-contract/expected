@@ -1,0 +1,2 @@
+error[E0277]: the trait bound `Item: std::marker::Copy` is not satisfied
+error: aborting due to 2 previous errors

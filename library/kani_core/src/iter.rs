@@ -73,26 +73,56 @@ macro_rules! generate_iter {
             pub len: usize,
         }
 
-        impl<T: Clone> KaniPtrIter<T> {
+        impl<T: Copy> KaniPtrIter<T> {
             pub fn new(ptr: *const T, len: usize) -> Self {
                 KaniPtrIter { ptr, len }
             }
         }
 
-        impl<T: Clone> KaniIter for KaniPtrIter<T> {
+        impl<T: Copy> KaniIter for KaniPtrIter<T> {
             type Item = T;
             fn nth(&self, i: usize) -> Self::Item {
-                unsafe { (&*self.ptr.wrapping_add(i)).clone() }
+                // Array, slice, and Vec adapters use this model only for `Copy`
+                // elements. Reading the bits directly matches Rust's copy/move
+                // semantics and avoids invoking an arbitrary `Clone` impl.
+                unsafe { self.ptr.wrapping_add(i).read() }
             }
             fn first(&self) -> Self::Item {
-                unsafe { (&*self.ptr).clone() }
+                unsafe { self.ptr.read() }
             }
             fn assumption(&self) -> bool {
                 //SAFETY: this call is safe as Rust compiler will complain if we write a for-loop for initnitialized object
-                unsafe { mem::is_allocated(self.ptr as *const (), self.len) }
+                let size = self.len.saturating_mul(stdmem::size_of::<T>());
+                unsafe { mem::is_allocated(self.ptr as *const (), size) }
             }
             fn len(&self) -> usize {
                 self.len
+            }
+        }
+
+        /// An owning iterator model for arrays.
+        ///
+        /// The standard array iterator owns the moved array. Keeping the array in this model is
+        /// important: returning a pointer into the by-value `self` argument of
+        /// `KaniIntoIter::kani_into_iter` would leave the iterator pointing at storage whose
+        /// callee lifetime has ended.
+        pub struct KaniArrayIter<T, const N: usize> {
+            pub array: [T; N],
+        }
+
+        impl<T: Copy, const N: usize> KaniIter for KaniArrayIter<T, N> {
+            type Item = T;
+            fn nth(&self, i: usize) -> Self::Item {
+                self.array[i]
+            }
+            fn first(&self) -> Self::Item {
+                self.array[0]
+            }
+            fn assumption(&self) -> bool {
+                true
+            }
+            fn len(&self) -> usize {
+                N
             }
         }
 
@@ -118,7 +148,8 @@ macro_rules! generate_iter {
             }
             fn assumption(&self) -> bool {
                 //SAFETY: this call is safe as Rust compiler will complain if we write a for-loop for uninitialized object
-                unsafe { mem::is_allocated(self.ptr as *const (), self.len) }
+                let size = self.len.saturating_mul(stdmem::size_of::<T>());
+                unsafe { mem::is_allocated(self.ptr as *const (), size) }
             }
             fn len(&self) -> usize {
                 self.len
@@ -212,7 +243,7 @@ macro_rules! generate_iter {
                 if self.iter1.len() > 0 { self.iter1.first() } else { self.iter2.first() }
             }
             fn assumption(&self) -> bool {
-                self.iter1.assumption() || self.iter2.assumption()
+                self.iter1.assumption() && self.iter2.assumption()
             }
             fn len(&self) -> usize {
                 self.iter1.len() + self.iter2.len()
@@ -370,9 +401,9 @@ macro_rules! generate_iter {
         }
 
         impl<T: Copy, const N: usize> KaniIntoIter for [T; N] {
-            type Iter = KaniPtrIter<T>;
+            type Iter = KaniArrayIter<T, N>;
             fn kani_into_iter(self) -> Self::Iter {
-                KaniPtrIter::new(self.as_ptr(), N)
+                KaniArrayIter { array: self }
             }
         }
 

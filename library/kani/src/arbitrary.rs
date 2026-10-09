@@ -268,10 +268,10 @@ pub fn slice_validity_assume<T>(_ptr: *const u8, _len: usize) {
 /// parameters of automatic harnesses: the parameter is instantiated with the *function
 /// item type* of the matching-arity model below (function items implement all three `Fn`
 /// traits and are zero-sized, so generating the value is trivial). Each call returns a
-/// fresh nondeterministic value, which over-approximates the behavior of every real
-/// closure with that signature (including stateful `FnMut` closures); verifying the
-/// harness against this instantiation therefore covers the function-under-test's own code
-/// for any closure behavior.
+/// fresh nondeterministic value, which over-approximates return values for a closure with
+/// that signature. It does not model arbitrary side effects of a real closure on its
+/// arguments, captured state, or global state; generic-function underapproximation
+/// therefore still applies to these generated function-item instantiations.
 ///
 /// These models are *optional* (c.f. `KaniModel::is_optional`).
 #[kanitool::fn_marker = "NondetFn0Model"]

@@ -1,0 +1,2 @@
+Cannot stub `foreign_fn` by `mismatched_stub`.
+Expected return type `u32`, but found `bool`

@@ -12,7 +12,6 @@ use crate::kani_middle::transform::{TransformPass, TransformationType};
 use crate::kani_queries::QueryDb;
 use cbmc::{InternString, InternedString};
 use rustc_middle::ty::TyCtxt;
-use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
     BinOp, Body, CastKind, ConstOperand, Mutability, Operand, Place, Rvalue, Terminator,
@@ -23,6 +22,7 @@ use rustc_public::ty::{
     ClosureDef, FnDef, GenericArgKind, GenericArgs, MirConst, RigidTy, Ty, TyKind, TypeAndMut,
     UintTy,
 };
+use rustc_public::{CrateDef, DefId};
 use rustc_span::Symbol;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -784,18 +784,18 @@ fn find_call_path(
 /// Check if a function with `#[kani::recursion]` is involved in mutual recursion.
 ///
 /// Scans the function's MIR body for calls to other functions that also have
-/// `#[kani::recursion]`. For each such callee, checks if the callee's body calls
-/// back to the original function (one level of indirection). If so, emits a
-/// compilation error because the per-function REENTRY mechanism only handles
-/// direct recursion soundly.
+/// `#[kani::recursion]`. For each such callee, follows the statically
+/// resolvable call graph and checks if it can reach the original function. If
+/// so, emits a compilation error because the per-function REENTRY mechanism
+/// only handles direct recursion soundly.
 ///
 /// We require both `has_contract()` and `has_recursion()` on the callee because
 /// if the callee has a contract but no `#[kani::recursion]`, Kani replaces the
 /// callee with its contract abstraction — no mutual recursion occurs.
 ///
-/// Limitations:
-/// - Only detects one level of indirection (f→g→f), not deeper chains (f→g→h→f).
-///   TODO(#3316): Extend to detect deeper mutual recursion chains.
+/// Calls through function pointers or trait objects are not followed because
+/// their target is not statically available in MIR. Such calls remain subject
+/// to the existing unresolved-call modeling and are outside this diagnostic.
 fn check_mutual_recursion(tcx: TyCtxt, fn_def: FnDef, body: &Body) {
     let fn_name = tcx.def_path_str(rustc_internal::internal(tcx, fn_def.def_id()));
 
@@ -806,11 +806,6 @@ fn check_mutual_recursion(tcx: TyCtxt, fn_def: FnDef, body: &Body) {
             continue;
         };
 
-        // Skip direct recursion (that's handled correctly by REENTRY).
-        if callee_def.def_id() == fn_def.def_id() {
-            continue;
-        }
-
         // Only error when the callee also uses #[kani::recursion] with a contract.
         // If the callee has a contract but no #[kani::recursion], Kani replaces
         // the call with the contract abstraction, so no mutual recursion occurs.
@@ -819,35 +814,92 @@ fn check_mutual_recursion(tcx: TyCtxt, fn_def: FnDef, body: &Body) {
             continue;
         }
 
-        // Check if the callee calls back to us (one level deep).
         let Ok(callee_instance) = Instance::resolve(callee_def, &callee_args) else { continue };
-        let Some(callee_body) = callee_instance.body() else { continue };
 
-        for callee_bb in callee_body.blocks.iter() {
-            let TerminatorKind::Call { func: callee_func, .. } = &callee_bb.terminator.kind else {
-                continue;
-            };
-            let Ok(callee_func_ty) = callee_func.ty(callee_body.locals()) else { continue };
-            let TyKind::RigidTy(RigidTy::FnDef(transitive_def, _)) = callee_func_ty.kind() else {
-                continue;
-            };
+        // Direct recursion is handled correctly by REENTRY. For every other
+        // recursively contracted callee, search the full statically
+        // resolvable call graph for a path back to this function.
+        if callee_def.def_id() == fn_def.def_id() {
+            continue;
+        }
+        let Some(path_length) = reaches_function_with_recursive_contract(
+            tcx,
+            &callee_instance,
+            fn_def.def_id(),
+            &mut HashSet::new(),
+        ) else {
+            continue;
+        };
 
-            if transitive_def.def_id() == fn_def.def_id() {
-                let callee_name =
-                    tcx.def_path_str(rustc_internal::internal(tcx, callee_def.def_id()));
-                let span = rustc_internal::internal(tcx, bb.terminator.source_info.span);
-                tcx.dcx().span_err(
-                    span,
-                    format!(
-                        "`#[kani::recursion]` is used on `{fn_name}`, which calls \
-                         `{callee_name}` that calls back to `{fn_name}`. \
-                         Mutual recursion is not supported by contract verification \
-                         and produces unsound results. Only direct recursion \
-                         (a function calling itself) is handled correctly."
-                    ),
-                );
-                break; // One error per callee is enough; continue checking other callees.
-            }
+        let callee_name = tcx.def_path_str(rustc_internal::internal(tcx, callee_def.def_id()));
+        let span = rustc_internal::internal(tcx, bb.terminator.source_info.span);
+
+        let message = if path_length == 1 {
+            format!(
+                "`#[kani::recursion]` is used on `{fn_name}`, which calls \
+                 `{callee_name}` that calls back to `{fn_name}`. \
+                 Mutual recursion is not supported by contract verification \
+                 and produces unsound results. Only direct recursion \
+                 (a function calling itself) is handled correctly."
+            )
+        } else {
+            format!(
+                "`#[kani::recursion]` is used on `{fn_name}`, which calls \
+                 `{callee_name}` and can reach back to `{fn_name}` through \
+                 mutual recursion. Mutual recursion is not supported by \
+                 contract verification and produces unsound results. Only \
+                 direct recursion (a function calling itself) is handled \
+                 correctly."
+            )
+        };
+        tcx.dcx().span_err(span, message);
+    }
+}
+
+/// Return whether `from` can reach a function with `root_def_id` through
+/// recursively contracted, statically resolvable calls.
+///
+/// The active-instance set prevents cycles that do not include the root from
+/// making this diagnostic recurse forever. We intentionally compare the root
+/// by `DefId`: reaching another monomorphization of the same recursive
+/// function still re-enters that function's contract instrumentation.
+fn reaches_function_with_recursive_contract(
+    tcx: TyCtxt,
+    from: &Instance,
+    root_def_id: DefId,
+    active: &mut HashSet<Instance>,
+) -> Option<usize> {
+    if from.def.def_id() == root_def_id {
+        return Some(0);
+    }
+    if !active.insert(*from) {
+        return None;
+    }
+
+    let Some(body) = from.body() else {
+        active.remove(from);
+        return None;
+    };
+
+    for bb in body.blocks.iter() {
+        let TerminatorKind::Call { func, .. } = &bb.terminator.kind else { continue };
+        let Ok(func_ty) = func.ty(body.locals()) else { continue };
+        let TyKind::RigidTy(RigidTy::FnDef(callee_def, callee_args)) = func_ty.kind() else {
+            continue;
+        };
+        let callee_attrs = KaniAttributes::for_def_id(tcx, callee_def.def_id());
+        if !callee_attrs.has_contract() || !callee_attrs.has_recursion() {
+            continue;
+        }
+        let Ok(callee) = Instance::resolve(callee_def, &callee_args) else { continue };
+        if let Some(path_length) =
+            reaches_function_with_recursive_contract(tcx, &callee, root_def_id, active)
+        {
+            active.remove(from);
+            return Some(path_length + 1);
         }
     }
+
+    active.remove(from);
+    None
 }

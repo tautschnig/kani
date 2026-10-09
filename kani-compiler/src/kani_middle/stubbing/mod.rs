@@ -75,19 +75,57 @@ fn generic_args_len_without_self(args: &GenericArgs) -> usize {
 /// does **NOT** check whether the type variables are constrained to implement
 /// the same traits; trait mismatches are checked during monomorphization.
 pub fn check_compatibility(tcx: TyCtxt, old_def: FnDef, new_def: FnDef) -> Result<(), String> {
-    // TODO: Validate stubs that do not have body.
-    // We could potentially look at the function signature to see if they match.
-    // However, they will include region information which can make types different.
-    let Some(old_body) = old_def.body() else { return Ok(()) };
-    let Some(new_body) = new_def.body() else { return Ok(()) };
+    // Function declarations without a body (in particular, foreign functions) still need to be
+    // checked. Letting an incompatible declaration through can make the replacement call fail
+    // later in code generation, or worse, give the backend a mismatched function type.
+    let old_body = old_def.body();
+    let new_body = new_def.body();
+
+    let old_sig = old_def.fn_sig().skip_binder();
+    let new_sig = new_def.fn_sig().skip_binder();
+
+    if old_sig.c_variadic != new_sig.c_variadic {
+        let msg = format!(
+            "function signature mismatch: original function/method `{}` and stub `{}` have different variadicness",
+            crate::kani_middle::strip_local_crate_prefix(old_def.name()),
+            crate::kani_middle::strip_local_crate_prefix(new_def.name()),
+        );
+        return Err(msg);
+    }
+    if old_sig.abi != new_sig.abi {
+        let msg = format!(
+            "function signature mismatch: original function/method `{}` and stub `{}` have different ABIs (`{:?}` vs `{:?}`)",
+            crate::kani_middle::strip_local_crate_prefix(old_def.name()),
+            crate::kani_middle::strip_local_crate_prefix(new_def.name()),
+            old_sig.abi,
+            new_sig.abi,
+        );
+        return Err(msg);
+    }
+    if old_sig.safety != new_sig.safety {
+        let msg = format!(
+            "function signature mismatch: original function/method `{}` and stub `{}` have different safety (`{:?}` vs `{:?}`)",
+            crate::kani_middle::strip_local_crate_prefix(old_def.name()),
+            crate::kani_middle::strip_local_crate_prefix(new_def.name()),
+            old_sig.safety,
+            new_sig.safety,
+        );
+        return Err(msg);
+    }
+
+    let old_arity =
+        old_body.as_ref().map_or_else(|| old_sig.inputs().len(), |body| body.arg_locals().len());
+    let new_arity =
+        new_body.as_ref().map_or_else(|| new_sig.inputs().len(), |body| body.arg_locals().len());
+
     // Check whether the arities match.
-    if old_body.arg_locals().len() != new_body.arg_locals().len() {
+    if old_arity != new_arity {
         let msg = format!(
             "arity mismatch: original function/method `{}` takes {} argument(s), stub `{}` takes {}",
             crate::kani_middle::strip_local_crate_prefix(old_def.name()),
-            old_body.arg_locals().len(),
+            old_arity,
             crate::kani_middle::strip_local_crate_prefix(new_def.name()),
-            new_body.arg_locals().len(),
+            new_arity,
         );
         return Err(msg);
     }
@@ -179,10 +217,12 @@ pub fn check_compatibility(tcx: TyCtxt, old_def: FnDef, new_def: FnDef) -> Resul
     // Note: Lifetime mismatches may still cause verification failures (#2007).
     let rename_args = tcx.mk_args(&rename_args);
 
-    let old_ret_ty = old_body.ret_local().ty;
-    let new_ret_ty = new_body.ret_local().ty;
+    let old_ret_ty = old_body.as_ref().map_or(old_sig.output(), |body| body.ret_local().ty);
+    let new_ret_ty = new_body.as_ref().map_or(new_sig.output(), |body| body.ret_local().ty);
     let old_ret_internal = rustc_internal::internal(tcx, old_ret_ty);
-    let new_ret_internal = rustc_internal::internal(tcx, new_ret_ty);
+    let old_ret_internal = tcx.erase_and_anonymize_regions(old_ret_internal);
+    let new_ret_internal =
+        tcx.erase_and_anonymize_regions(rustc_internal::internal(tcx, new_ret_ty));
     let new_ret_renamed =
         EarlyBinder::bind(tcx, new_ret_internal).instantiate(tcx, rename_args).skip_normalization();
 
@@ -191,20 +231,28 @@ pub fn check_compatibility(tcx: TyCtxt, old_def: FnDef, new_def: FnDef) -> Resul
     if old_ret_internal != new_ret_renamed {
         diff.push(format!("Expected return type `{old_ret_ty}`, but found `{new_ret_ty}`"));
     }
-    for (i, (old_arg, new_arg)) in
-        old_body.arg_locals().iter().zip(new_body.arg_locals().iter()).enumerate()
-    {
-        let old_ty_internal = rustc_internal::internal(tcx, old_arg.ty);
-        let new_ty_internal = rustc_internal::internal(tcx, new_arg.ty);
+    let old_arg_tys = old_body.as_ref().map_or_else(
+        || old_sig.inputs().to_vec(),
+        |body| body.arg_locals().iter().map(|local| local.ty).collect(),
+    );
+    let new_arg_tys = new_body.as_ref().map_or_else(
+        || new_sig.inputs().to_vec(),
+        |body| body.arg_locals().iter().map(|local| local.ty).collect(),
+    );
+    for (i, (old_arg, new_arg)) in old_arg_tys.iter().zip(new_arg_tys.iter()).enumerate() {
+        let old_ty_internal =
+            tcx.erase_and_anonymize_regions(rustc_internal::internal(tcx, *old_arg));
+        let new_ty_internal =
+            tcx.erase_and_anonymize_regions(rustc_internal::internal(tcx, *new_arg));
         let new_renamed = EarlyBinder::bind(tcx, new_ty_internal)
             .instantiate(tcx, rename_args)
             .skip_normalization();
         if old_ty_internal != new_renamed {
             diff.push(format!(
                 "Expected type `{}` for parameter {}, but found `{}`",
-                old_arg.ty,
+                old_arg,
                 i + 1,
-                new_arg.ty
+                new_arg
             ));
         }
     }

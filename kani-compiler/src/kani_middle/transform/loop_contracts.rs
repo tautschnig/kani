@@ -18,10 +18,12 @@ use itertools::Itertools;
 use rustc_middle::ty::TyCtxt;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
-    AggregateKind, BasicBlock, BasicBlockIdx, Body, ConstOperand, Operand, Place, Rvalue,
-    Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind, VarDebugInfoContents,
-    WithRetag,
+    AggregateKind, BasicBlock, BasicBlockIdx, Body, ConstOperand, Operand, Place, ProjectionElem,
+    Rvalue, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind,
+    VarDebugInfoContents, WithRetag,
 };
+use rustc_public::rustc_internal;
+use rustc_public::ty::ClosureKind;
 use rustc_public::ty::{FnDef, GenericArgKind, MirConst, RigidTy, TyKind, UintTy};
 use rustc_span::Symbol;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -34,6 +36,139 @@ pub struct LoopContractPass {
     /// The map from original loop head to the new loop latch.
     /// We use this map to redirect all original loop latches to a new single loop latch.
     new_loop_latches: HashMap<usize, usize>,
+}
+
+/// Conservatively check whether a loop-contract closure can change program state.
+///
+/// Loop-contract expressions are evaluated by CBMC as loop annotations rather than ordinary Rust
+/// statements. A write performed while evaluating the expression can therefore change the guard or
+/// body being verified. Direct assignments are rejected by the proc macro; this MIR-level check
+/// closes the remaining call-based gap by following resolvable calls and rejecting effects in their
+/// bodies as well.
+struct LoopContractEffectChecker<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    active: HashSet<Instance>,
+    effects: bool,
+}
+
+impl<'tcx> LoopContractEffectChecker<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self { tcx, active: HashSet::new(), effects: false }
+    }
+
+    fn has_effects(mut self, instance: Instance) -> bool {
+        self.check_instance(instance);
+        self.effects
+    }
+
+    fn writes_observable_place(body: &Body, place: &Place) -> bool {
+        !place.projection.is_empty()
+            && (place.local <= body.arg_locals().len()
+                || place.projection.iter().any(|elem| matches!(elem, ProjectionElem::Deref)))
+    }
+
+    fn check_instance(&mut self, instance: Instance) {
+        if self.effects {
+            return;
+        }
+        if !self.active.insert(instance) {
+            // Recursive calls cannot be shown pure by this finite traversal.
+            self.effects = true;
+            return;
+        }
+
+        let Some(body) = instance.body() else {
+            if matches!(
+                instance.intrinsic_name().as_deref(),
+                Some("caller_location" | "saturating_add" | "saturating_sub")
+            ) {
+                self.active.remove(&instance);
+                return;
+            }
+            let def_id = rustc_internal::internal(self.tcx, instance.def.def_id());
+            if Some(def_id) == self.tcx.lang_items().panic_fn()
+                || Some(def_id) == self.tcx.lang_items().panic_fmt()
+                || Some(def_id) == self.tcx.lang_items().begin_panic_fn()
+                || instance.def.name().starts_with("core::panicking::")
+                || instance.def.name().starts_with("std::panicking::")
+                || instance.def.name().starts_with("std::rt::panic_fmt::")
+                || instance.def.name().ends_with("rust_begin_unwind")
+            {
+                self.active.remove(&instance);
+                return;
+            }
+            self.effects = true;
+            self.active.remove(&instance);
+            return;
+        };
+
+        for block in &body.blocks {
+            for statement in &block.statements {
+                match &statement.kind {
+                    StatementKind::Assign(place, _rvalue) => {
+                        if Self::writes_observable_place(&body, place) {
+                            self.effects = true;
+                            break;
+                        }
+                    }
+                    StatementKind::Intrinsic(..) => {
+                        self.effects = true;
+                        break;
+                    }
+                    StatementKind::SetDiscriminant { place, .. } => {
+                        if Self::writes_observable_place(&body, place) {
+                            self.effects = true;
+                            break;
+                        }
+                    }
+                    StatementKind::FakeRead(..)
+                    | StatementKind::StorageLive(..)
+                    | StatementKind::StorageDead(..)
+                    | StatementKind::PlaceMention(..)
+                    | StatementKind::AscribeUserType { .. }
+                    | StatementKind::Coverage(..)
+                    | StatementKind::ConstEvalCounter
+                    | StatementKind::Nop => {}
+                }
+            }
+            if self.effects {
+                break;
+            }
+
+            match &block.terminator.kind {
+                TerminatorKind::Call { func, .. } => {
+                    let Ok(func_ty) = func.ty(body.locals()) else {
+                        self.effects = true;
+                        break;
+                    };
+                    let TyKind::RigidTy(RigidTy::FnDef(def, args)) = func_ty.kind() else {
+                        self.effects = true;
+                        break;
+                    };
+                    let Ok(callee) = Instance::resolve(def, &args) else {
+                        self.effects = true;
+                        break;
+                    };
+                    self.check_instance(callee);
+                }
+                TerminatorKind::Drop { .. } | TerminatorKind::InlineAsm { .. } => {
+                    self.effects = true;
+                }
+                TerminatorKind::Goto { .. }
+                | TerminatorKind::SwitchInt { .. }
+                | TerminatorKind::Assert { .. }
+                | TerminatorKind::Resume
+                | TerminatorKind::Abort
+                | TerminatorKind::Return
+                | TerminatorKind::Unreachable => {}
+            }
+            if self.effects {
+                break;
+            }
+        }
+
+        self.active.remove(&instance);
+    }
 }
 
 impl TransformPass for LoopContractPass {
@@ -1113,9 +1248,19 @@ impl LoopContractPass {
                 let Some(GenericArgKind::Type(arg_ty)) = genarg.0.first() else {
                     return false;
                 };
-                let TyKind::RigidTy(RigidTy::Closure(_, genarg)) = arg_ty.kind() else {
+                let TyKind::RigidTy(RigidTy::Closure(closure_def, genarg)) = arg_ty.kind() else {
                     return false;
                 };
+                if let Ok(closure_instance) =
+                    Instance::resolve_closure(closure_def, &genarg, ClosureKind::Fn)
+                    && LoopContractEffectChecker::new(tcx).has_effects(closure_instance)
+                {
+                    tcx.dcx().span_err(
+                        rustc_internal::internal(tcx, terminator.source_info.span),
+                        "loop-contract expression has side effects that Kani cannot soundly model",
+                    );
+                    tcx.dcx().abort_if_errors();
+                }
                 // We look for the args' types of the kani_register_loop_contract function
                 // They are always stored in a tuple, which is next to the FnPtr generic args of kani_registered_loop_contract fn
                 // All the generic args before the FnPtr are from the outer function

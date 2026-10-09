@@ -1,0 +1,1 @@
+function signature mismatch: original function/method `foreign_fn` and stub `mismatched_stub` have different ABIs

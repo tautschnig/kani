@@ -6,7 +6,11 @@
 //! while maintaining the semantics of the loop.
 use crate::{KaniIntoIter, KaniPtrIter};
 
-impl<T: Clone> KaniIntoIter for Vec<T> {
+// The loop-contract lowering calls `nth` on an immutable iterator model. For a
+// consuming `Vec` iterator, returning a cloned element is only equivalent to
+// moving it when `T: Copy`; a user-defined `Clone` implementation may have
+// arbitrary effects or return a different value.
+impl<T: Copy> KaniIntoIter for Vec<T> {
     type Iter = KaniPtrIter<T>;
     fn kani_into_iter(self) -> Self::Iter {
         let s = self.iter();
