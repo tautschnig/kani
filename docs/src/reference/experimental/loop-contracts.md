@@ -473,9 +473,10 @@ The following limitations apply to decreases clauses in Kani. We compare with
    cannot prove termination, simply omit the decreases clause. The loop will still be abstracted
    by the invariant, but without a termination guarantee.
 
-5. **No side-effect checking.** Kani does not verify that decreases clause expressions are
-   side-effect free. A decreases clause with side effects (e.g., mutation of variables) could lead
-   to unsound results. The user must ensure the expression is pure.
+5. **Incomplete side-effect checking.** Direct assignments and side effects in calls that Kani can
+   resolve are rejected in loop-contract expressions. Effects hidden behind unsupported or
+   indirect constructs may not be detected, so the user must ensure every expression, including
+   called functions, is pure.
 
 6. **Strict decrease only.** CBMC checks `new_measure < old_measure` using strict integer
    comparison. There is no support for custom well-founded orderings or user-defined comparison
@@ -584,11 +585,11 @@ loop's progress that holds at every iteration boundary. A good approach:
 
 Loop contracts comes with the following limitations.
 
-1. `while` loops, `loop` loops are supported. `for` loops are supported for array, slice, Iter, Vec, Range, StepBy, Chain, Zip, Map, and Enumerate. The other kinds of loops are not supported: [`while let` loops](https://doc.rust-lang.org/reference/expressions/loop-expr.html#predicate-pattern-loops).
+1. `while` loops, `loop` loops are supported. `for` loops are supported for array, slice, Iter, `Vec<T>` where `T: Copy`, Range, StepBy, Chain, Zip, Map, and Enumerate. The other kinds of loops are not supported: [`while let` loops](https://doc.rust-lang.org/reference/expressions/loop-expr.html#predicate-pattern-loops).
 2. Kani infers *loop modifies* with alias analysis. Loop modifies are those variables we assume to be arbitrary in the inductive hypothesis, and should cover all memory locations that are written to during 
    the execution of the loops. A proof will fail if the inferred loop modifies misses some targets written in the loops.
    We observed this happens when some fields of structs are modified by some other functions called in the loops.
-3. We don't check if loop contracts (invariants, decreases clauses) are side-effect free. A loop contract with a side effect could lead to an unsound proof result. Make sure that the specified loop contracts are side-effect free.
+3. Direct assignments and resolved side-effecting calls in loop-contract expressions are rejected because they can change the loop guard and lead to an unsound proof result. Effects hidden behind unsupported or indirect constructs may not be detected; make sure all loop-contract expressions, including called functions, are side-effect free.
 4. Decreases clauses only support integer-typed expressions. See the [decreases clause limitations](#decreases-clause-limitations-and-comparison-with-other-tools) section for a detailed comparison with other verification tools.
 5. Decreases clauses have the following known bugs (tracked in [#3168](https://github.com/model-checking/kani/issues/3168)):
    - **Struct field projections** in decreases expressions (e.g., `#[kani::loop_decreases(s.field)]`) are not correctly processed by CBMC — the check always fails even when the measure genuinely decreases.

@@ -148,6 +148,10 @@ lifetime information. This means that a stub with different lifetime annotations
 original will be accepted. For example, a stub returning `&'static i32` will be accepted as
 a replacement for a function returning `&'a i32`.
 
+This check also applies when the original function has no MIR body, such as a function declared
+in an `extern` block. In particular, a foreign function cannot be replaced by a stub with a
+different parameter or return type.
+
 **Warning:** While Kani accepts such stubs, lifetime mismatches can cause subtle verification
 failures (e.g., "dereference failure: dead object"). If you encounter unexpected failures with
 stubs, check whether the lifetime annotations match.

@@ -363,6 +363,10 @@ instantiated name, e.g.:
 Verifying a single instantiation is an underapproximation of all of the function's possible behaviors:
 a successful result for `foo::<i32>` does not imply that other instantiations of `foo` are also safe.
 Kani makes this explicit by displaying the instantiated name of the verified function.
+For `Fn`/`FnMut`/`FnOnce` bounds, the generated function-item models provide fresh
+nondeterministic return values, but do not model arbitrary side effects through arguments,
+captures, or global state. Such a result is therefore conditional on the selected model's
+side-effect behavior as well as its concrete type instantiation.
 
 `usize` const generic parameters (e.g. array lengths) are instantiated with the value 2.
 

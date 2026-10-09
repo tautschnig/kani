@@ -60,3 +60,11 @@ We now assume that all quantified variables are of type `usize`. This means that
 The default SAT-based solver backend only supports quantifiers with constant bounds. A quantifier whose bound is symbolic (not known at compile time) cannot be encoded and would be silently replaced with an unconstrained value, which is unsound: a `kani::assume` containing such a quantifier would not be enforced, and a `kani::assert` containing one could fail spuriously.
 
 To keep results sound, Kani reports verification as `FAILED` when the backend drops a quantifier, and directs you to an SMT solver backend that supports quantifiers. Use `#[kani::solver(z3)]` on the harness (or `--solver z3` on the command line) to verify these quantifiers.
+
+#### Predicate purity
+
+Quantifier predicates must be pure. Kani rejects assertions, assumptions,
+runtime checks, function calls that cannot be proven pure by its limited
+inliner, memory writes, and nondeterministic values inside a predicate. These
+effects cannot be represented faithfully inside CBMC's quantified expression;
+silently dropping them could make an invalid program appear verified.
